@@ -2,6 +2,7 @@ import express from "express";
 import auth from "../middleware/auth.js";
 import authorize from "../middleware/authorize.js";
 import pool from "../db.js";
+import { deductInventoryForOrder } from "./inventory.js";
 
 const router = express.Router();
 
@@ -32,6 +33,15 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
     await Promise.all(insertItems);
 
     await client.query("COMMIT");
+    
+    // Deduct inventory automatically
+    try {
+      await deductInventoryForOrder(orderId, items);
+    } catch (invErr) {
+      console.error("Inventory deduction failed (non-critical):", invErr);
+      // Don't fail the order if inventory deduction fails
+    }
+
     return res.status(201).json({ id: orderId });
   } catch (err) {
     await client.query("ROLLBACK");

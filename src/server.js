@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import authRoutes from "./routes/auth.js";
 import orderRoutes from "./routes/orders.js";
 import adminRoutes from "./routes/admin.js";
+import inventoryRoutes from "./routes/inventory.js";
 
 dotenv.config();
 
@@ -19,6 +20,7 @@ app.get("/api/health", (_req, res) =>
 app.use("/api/auth", authRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/inventory", inventoryRoutes);
 
 const port = process.env.PORT || 4000;
 app.listen(port, () => {
