@@ -7,6 +7,224 @@ import pool from "../db.js";
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+const BACKUP_TABLES = [
+  "products",
+  "inventory_items",
+  "product_ingredients",
+  "inventory_alerts",
+  "customers",
+  "customer_contacts",
+  "customer_notes",
+  "customer_tags",
+  "customer_tag_map",
+  "customer_loyalty_txns",
+  "customer_campaigns",
+  "orders",
+  "order_items",
+];
+
+const RESTORE_ORDER = [
+  "products",
+  "inventory_items",
+  "customers",
+  "customer_tags",
+  "customer_campaigns",
+  "orders",
+  "product_ingredients",
+  "inventory_alerts",
+  "customer_contacts",
+  "customer_notes",
+  "customer_tag_map",
+  "customer_loyalty_txns",
+  "order_items",
+];
+
+const RESETTABLE_TABLES = [
+  "order_items",
+  "orders",
+  "product_ingredients",
+  "inventory_alerts",
+  "inventory_items",
+  "customer_contacts",
+  "customer_notes",
+  "customer_tag_map",
+  "customer_loyalty_txns",
+  "customer_campaigns",
+  "customer_tags",
+  "customers",
+  "products",
+];
+
+function quoteIdentifier(value) {
+  return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+async function getExistingTables(client, tableNames) {
+  const { rows } = await client.query(
+    `SELECT tablename
+     FROM pg_tables
+     WHERE schemaname = 'public'
+       AND tablename = ANY($1::text[])`,
+    [tableNames]
+  );
+
+  return new Set(rows.map((row) => row.tablename));
+}
+
+async function truncateBusinessTables(client) {
+  const existingTables = await getExistingTables(client, RESETTABLE_TABLES);
+  const tablesToTruncate = RESETTABLE_TABLES.filter((tableName) =>
+    existingTables.has(tableName)
+  );
+
+  if (tablesToTruncate.length === 0) {
+    return [];
+  }
+
+  await client.query(
+    `TRUNCATE TABLE ${tablesToTruncate
+      .map((tableName) => quoteIdentifier(tableName))
+      .join(", ")} RESTART IDENTITY CASCADE`
+  );
+
+  return tablesToTruncate;
+}
+
+async function buildBackupCsv(client) {
+  const existingTables = await getExistingTables(client, BACKUP_TABLES);
+  const lines = ["table,id,data_base64"];
+  let totalRows = 0;
+
+  for (const tableName of BACKUP_TABLES) {
+    if (!existingTables.has(tableName)) {
+      continue;
+    }
+
+    const { rows } = await client.query(
+      `SELECT * FROM ${quoteIdentifier(tableName)} ORDER BY 1 ASC`
+    );
+
+    rows.forEach((row, index) => {
+      const encodedRow = Buffer.from(JSON.stringify(row), "utf8").toString(
+        "base64"
+      );
+      lines.push(`${tableName},${index + 1},${encodedRow}`);
+      totalRows += 1;
+    });
+  }
+
+  return { csv: lines.join("\n"), totalRows };
+}
+
+function parseBackupCsv(rawContent) {
+  const lines = String(rawContent || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    throw new Error("Backup file is empty");
+  }
+
+  if (lines[0] !== "table,id,data_base64") {
+    throw new Error("Invalid backup file format");
+  }
+
+  const parsedRows = new Map();
+
+  for (let i = 1; i < lines.length; i += 1) {
+    const [tableName, _rowNumber, encodedRow] = lines[i].split(",", 3);
+
+    if (!tableName || !encodedRow) {
+      throw new Error(`Invalid backup row at line ${i + 1}`);
+    }
+
+    let rowData;
+    try {
+      const decoded = Buffer.from(encodedRow, "base64").toString("utf8");
+      rowData = JSON.parse(decoded);
+    } catch (_decodeErr) {
+      throw new Error(`Corrupted backup row at line ${i + 1}`);
+    }
+
+    if (!parsedRows.has(tableName)) {
+      parsedRows.set(tableName, []);
+    }
+    parsedRows.get(tableName).push(rowData);
+  }
+
+  return parsedRows;
+}
+
+async function insertRows(client, tableName, rows) {
+  for (const row of rows) {
+    const columns = Object.keys(row);
+    if (columns.length === 0) {
+      continue;
+    }
+
+    const query = `INSERT INTO ${quoteIdentifier(tableName)} (${columns
+      .map((column) => quoteIdentifier(column))
+      .join(", ")})
+      VALUES (${columns.map((_column, idx) => `$${idx + 1}`).join(", ")})`;
+
+    const values = columns.map((column) => row[column]);
+    await client.query(query, values);
+  }
+}
+
+async function syncTableSequence(client, tableName) {
+  const { rows } = await client.query(
+    "SELECT pg_get_serial_sequence($1, 'id') AS sequence_name",
+    [tableName]
+  );
+  const sequenceName = rows[0]?.sequence_name;
+
+  if (!sequenceName) {
+    return;
+  }
+
+  const { rows: maxRows } = await client.query(
+    `SELECT MAX(id) AS max_id FROM ${quoteIdentifier(tableName)}`
+  );
+  const maxId = Number(maxRows[0]?.max_id || 0);
+
+  if (maxId > 0) {
+    await client.query("SELECT setval($1, $2, true)", [sequenceName, maxId]);
+    return;
+  }
+
+  await client.query("SELECT setval($1, 1, false)", [sequenceName]);
+}
+
+async function restoreFromParsedRows(client, parsedRows) {
+  const existingTables = await getExistingTables(client, RESTORE_ORDER);
+  let restoredRows = 0;
+
+  for (const tableName of RESTORE_ORDER) {
+    if (!existingTables.has(tableName)) {
+      continue;
+    }
+
+    const rows = parsedRows.get(tableName) || [];
+    if (rows.length === 0) {
+      continue;
+    }
+
+    await insertRows(client, tableName, rows);
+    restoredRows += rows.length;
+  }
+
+  for (const tableName of RESTORE_ORDER) {
+    if (!existingTables.has(tableName)) {
+      continue;
+    }
+    await syncTableSequence(client, tableName);
+  }
+
+  return restoredRows;
+}
+
 // List products (ADMIN only for management) - includes stock for inventory
 router.get("/products", auth, authorize("ADMIN"), async (_req, res) => {
   try {
@@ -154,15 +372,21 @@ router.get("/dashboard/stats", auth, authorize("ADMIN"), async (_req, res) => {
   }
 });
 
-// Dashboard sales chart (last 7 days)
-router.get("/dashboard/sales-chart", auth, authorize("ADMIN"), async (_req, res) => {
+// Dashboard sales chart
+router.get("/dashboard/sales-chart", auth, authorize("ADMIN"), async (req, res) => {
   try {
+    const requestedDays = parseInt(req.query.days, 10);
+    const days = Number.isFinite(requestedDays)
+      ? Math.min(Math.max(requestedDays, 7), 365)
+      : 7;
+
     const { rows } = await pool.query(
       `SELECT DATE(created_at) as day, COALESCE(SUM(total), 0) as total 
        FROM orders 
-       WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
+       WHERE created_at >= CURRENT_DATE - (($1 || ' days')::interval)
        GROUP BY DATE(created_at) 
-       ORDER BY day ASC`
+       ORDER BY day ASC`,
+      [days]
     );
     return res.json(rows.map(r => ({ day: r.day, total: parseFloat(r.total || 0) })));
   } catch (err) {
@@ -286,10 +510,121 @@ router.get("/reports/sales", auth, authorize("ADMIN"), async (req, res) => {
   }
 });
 
+// CSV backup download
+router.get("/backup/csv", auth, authorize("ADMIN"), async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const { csv, totalRows } = await buildBackupCsv(client);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `camellia-backup-${timestamp}.csv`;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.setHeader("X-Backup-Rows", String(totalRows));
+    return res.status(200).send(csv);
+  } catch (err) {
+    console.error("Backup generation failed:", err);
+    return res.status(500).json({ message: "Failed to generate CSV backup" });
+  } finally {
+    client.release();
+  }
+});
+
+// Restore from CSV backup
+router.post(
+  "/restore/csv",
+  auth,
+  authorize("ADMIN"),
+  upload.single("file"),
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ message: "CSV backup file is required" });
+    }
+
+    let parsedRows;
+    try {
+      parsedRows = parseBackupCsv(req.file.buffer.toString("utf8"));
+    } catch (err) {
+      return res.status(400).json({
+        message:
+          err?.message ||
+          "Invalid backup file. Please use a CSV downloaded from this system.",
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const truncatedTables = await truncateBusinessTables(client);
+      const restoredRows = await restoreFromParsedRows(client, parsedRows);
+      await client.query("COMMIT");
+
+      return res.json({
+        message: "System restored successfully from CSV backup",
+        restoredRows,
+        truncatedTables,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Restore failed:", err);
+      return res.status(500).json({
+        message:
+          "Restore failed. Please verify the backup file and try again.",
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Reset all business data (users are preserved)
+router.post("/reset", auth, authorize("ADMIN"), async (req, res) => {
+  const providedSecret = String(req.body?.secretCode || "").trim();
+  const configuredSecret = String(
+    process.env.SYSTEM_RESET_SECRET ||
+      process.env.RESET_SECRET_CODE ||
+      process.env.JWT_SECRET ||
+      ""
+  ).trim();
+
+  if (!configuredSecret) {
+    return res.status(500).json({
+      message:
+        "System reset secret is not configured. Set SYSTEM_RESET_SECRET in backend .env.",
+    });
+  }
+
+  if (!providedSecret) {
+    return res.status(400).json({ message: "Reset secret code is required" });
+  }
+
+  if (providedSecret !== configuredSecret) {
+    return res.status(403).json({ message: "Invalid reset secret code" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const truncatedTables = await truncateBusinessTables(client);
+    await client.query("COMMIT");
+    return res.json({
+      message: "System reset completed successfully",
+      truncatedTables,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("System reset failed:", err);
+    return res.status(500).json({ message: "System reset failed" });
+  } finally {
+    client.release();
+  }
+});
+
 // Backup stub
 router.post("/backup", auth, authorize("ADMIN"), async (_req, res) => {
-  // In production, run pg_dump and stream file; here we just acknowledge.
-  return res.json({ message: "Backup triggered (stub)" });
+  return res.json({
+    message: "Backup is available through the CSV download action.",
+  });
 });
 
 // Restore stub
@@ -302,11 +637,11 @@ router.post(
     if (!req.file) {
       return res.status(400).json({ message: "Backup file is required" });
     }
-    // In production, feed file buffer to psql; here we just acknowledge.
-    return res.json({ message: "Restore received (stub)" });
+    return res.json({
+      message: "Restore is available through the CSV restore action.",
+    });
   }
 );
 
 
 export default router;
-
