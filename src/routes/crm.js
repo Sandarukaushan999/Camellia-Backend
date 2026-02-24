@@ -14,8 +14,11 @@ import {
 const router = express.Router();
 
 const allowedOrderTypes = new Set(["DINE-IN", "TAKEAWAY", "DELIVERY", "OTHER"]);
-const allowedChannels = new Set(["POS", "PHONE", "WHATSAPP", "WEB", "OTHER"]);
+const allowedChannels = new Set(["POS", "PHONE", "WHATSAPP", "WEB", "SMS", "EMAIL", "OTHER"]);
 const allowedCampaignStatus = new Set(["DRAFT", "SCHEDULED", "ACTIVE", "PAUSED", "SENT"]);
+const allowedFollowupStatus = new Set(["OPEN", "IN_PROGRESS", "COMPLETED", "CANCELLED"]);
+const allowedFollowupPriority = new Set(["LOW", "MEDIUM", "HIGH", "URGENT"]);
+const allowedFollowupChannels = new Set(["PHONE", "SMS", "WHATSAPP", "EMAIL", "OTHER"]);
 
 const SEGMENT_CASE_SQL = `CASE
   WHEN c.last_order_at IS NULL THEN 'NEW'
@@ -46,6 +49,22 @@ function parseNonNegativeNumber(value, fallback = null) {
     return fallback;
   }
   return parsed;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (value === true || value === false) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
+  }
+  return fallback;
 }
 
 function parseIntArray(value) {
@@ -83,6 +102,27 @@ function normalizeAudienceFilter(input = {}) {
     include_inactive: includeInactive,
     tag_ids: Array.from(new Set(parseIntArray(filter.tag_ids))).slice(0, 30),
   };
+}
+
+function normalizeFollowupStatus(value, fallback = "OPEN") {
+  const normalized = String(value || fallback)
+    .trim()
+    .toUpperCase();
+  return allowedFollowupStatus.has(normalized) ? normalized : fallback;
+}
+
+function normalizeFollowupPriority(value, fallback = "MEDIUM") {
+  const normalized = String(value || fallback)
+    .trim()
+    .toUpperCase();
+  return allowedFollowupPriority.has(normalized) ? normalized : fallback;
+}
+
+function normalizeFollowupChannel(value, fallback = "PHONE") {
+  const normalized = String(value || fallback)
+    .trim()
+    .toUpperCase();
+  return allowedFollowupChannels.has(normalized) ? normalized : fallback;
 }
 
 function buildCustomerAudienceWhere(filterInput) {
@@ -427,6 +467,61 @@ router.put("/customers/:id", auth, authorize("ADMIN"), async (req, res) => {
   }
 });
 
+// Delete/deactivate customer
+router.delete("/customers/:id", auth, authorize("ADMIN"), async (req, res) => {
+  const { id } = req.params;
+  const mode = String(req.query.mode || "").trim().toLowerCase();
+  const forceHardDelete = mode === "hard" || parseBoolean(req.query.force, false);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const customerRes = await client.query(
+      `SELECT id, full_name, is_active, total_orders
+       FROM customers
+       WHERE id = $1
+       FOR UPDATE`,
+      [id]
+    );
+
+    if (!customerRes.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    if (!forceHardDelete) {
+      const { rows } = await client.query(
+        `UPDATE customers
+         SET is_active = false,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [id]
+      );
+      await client.query("COMMIT");
+      return res.json({
+        message: "Customer deactivated",
+        mode: "soft",
+        customer: rows[0],
+      });
+    }
+
+    await client.query(`DELETE FROM customers WHERE id = $1`, [id]);
+    await client.query("COMMIT");
+    return res.json({
+      message: "Customer deleted permanently",
+      mode: "hard",
+      customer_id: id,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("CRM delete customer failed:", err);
+    return res.status(500).json({ message: "Failed to delete customer" });
+  } finally {
+    client.release();
+  }
+});
+
 // Add note to customer
 router.post("/customers/:id/notes", auth, authorize("ADMIN"), async (req, res) => {
   const note = String(req.body.note || "").trim();
@@ -446,6 +541,53 @@ router.post("/customers/:id/notes", auth, authorize("ADMIN"), async (req, res) =
   } catch (err) {
     console.error("CRM add note failed:", err);
     return res.status(500).json({ message: "Failed to add note" });
+  }
+});
+
+// Update note
+router.put("/customers/:customerId/notes/:noteId", auth, authorize("ADMIN"), async (req, res) => {
+  const note = String(req.body.note || "").trim();
+  if (!note) {
+    return res.status(400).json({ message: "Note is required" });
+  }
+
+  try {
+    const { customerId, noteId } = req.params;
+    const { rows } = await pool.query(
+      `UPDATE customer_notes
+       SET note = $1
+       WHERE id = $2
+         AND customer_id = $3
+       RETURNING id, customer_id, note, created_at`,
+      [note, noteId, customerId]
+    );
+    if (!rows[0]) {
+      return res.status(404).json({ message: "Note not found" });
+    }
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("CRM update note failed:", err);
+    return res.status(500).json({ message: "Failed to update note" });
+  }
+});
+
+// Delete note
+router.delete("/customers/:customerId/notes/:noteId", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const { customerId, noteId } = req.params;
+    const { rowCount } = await pool.query(
+      `DELETE FROM customer_notes
+       WHERE id = $1
+         AND customer_id = $2`,
+      [noteId, customerId]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ message: "Note not found" });
+    }
+    return res.json({ message: "Note deleted" });
+  } catch (err) {
+    console.error("CRM delete note failed:", err);
+    return res.status(500).json({ message: "Failed to delete note" });
   }
 });
 
@@ -492,6 +634,132 @@ router.post("/customers/:id/loyalty", auth, authorize("ADMIN"), async (req, res)
     await client.query("ROLLBACK");
     console.error("CRM loyalty adjustment failed:", err);
     return res.status(500).json({ message: "Failed to update loyalty points" });
+  } finally {
+    client.release();
+  }
+});
+
+// Edit manual loyalty transaction
+router.put("/customers/:id/loyalty/txns/:txnId", auth, authorize("ADMIN"), async (req, res) => {
+  const pointsChange = parseInt(req.body.points_change, 10);
+  const reason = String(req.body.reason || "MANUAL_ADJUSTMENT").trim().slice(0, 120);
+  if (!Number.isFinite(pointsChange) || pointsChange === 0) {
+    return res.status(400).json({ message: "points_change must be a non-zero integer" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const txnRes = await client.query(
+      `SELECT id, customer_id, order_id, points_change
+       FROM customer_loyalty_txns
+       WHERE id = $1
+         AND customer_id = $2
+       FOR UPDATE`,
+      [req.params.txnId, req.params.id]
+    );
+    const txn = txnRes.rows[0];
+    if (!txn) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Loyalty transaction not found" });
+    }
+    if (txn.order_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Order-linked loyalty transactions cannot be edited" });
+    }
+
+    const customerRes = await client.query(
+      `SELECT id, loyalty_points
+       FROM customers
+       WHERE id = $1
+       FOR UPDATE`,
+      [req.params.id]
+    );
+    if (!customerRes.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    const delta = pointsChange - Number.parseInt(txn.points_change || 0, 10);
+    await client.query(
+      `UPDATE customer_loyalty_txns
+       SET points_change = $1,
+           reason = $2
+       WHERE id = $3`,
+      [pointsChange, reason, req.params.txnId]
+    );
+    await client.query(
+      `UPDATE customers
+       SET loyalty_points = GREATEST(0, COALESCE(loyalty_points, 0) + $2),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [req.params.id, delta]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ message: "Loyalty transaction updated" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("CRM update loyalty transaction failed:", err);
+    return res.status(500).json({ message: "Failed to update loyalty transaction" });
+  } finally {
+    client.release();
+  }
+});
+
+// Delete manual loyalty transaction
+router.delete("/customers/:id/loyalty/txns/:txnId", auth, authorize("ADMIN"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const txnRes = await client.query(
+      `SELECT id, customer_id, order_id, points_change
+       FROM customer_loyalty_txns
+       WHERE id = $1
+         AND customer_id = $2
+       FOR UPDATE`,
+      [req.params.txnId, req.params.id]
+    );
+    const txn = txnRes.rows[0];
+    if (!txn) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Loyalty transaction not found" });
+    }
+    if (txn.order_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Order-linked loyalty transactions cannot be deleted" });
+    }
+
+    const customerRes = await client.query(
+      `SELECT id, loyalty_points
+       FROM customers
+       WHERE id = $1
+       FOR UPDATE`,
+      [req.params.id]
+    );
+    if (!customerRes.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    const reversal = 0 - Number.parseInt(txn.points_change || 0, 10);
+    await client.query(
+      `UPDATE customers
+       SET loyalty_points = GREATEST(0, COALESCE(loyalty_points, 0) + $2),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [req.params.id, reversal]
+    );
+    await client.query(`DELETE FROM customer_loyalty_txns WHERE id = $1`, [req.params.txnId]);
+
+    await client.query("COMMIT");
+    return res.json({ message: "Loyalty transaction deleted" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("CRM delete loyalty transaction failed:", err);
+    return res.status(500).json({ message: "Failed to delete loyalty transaction" });
   } finally {
     client.release();
   }
@@ -589,6 +857,74 @@ router.post("/tags", auth, authorize("ADMIN"), async (req, res) => {
     }
     console.error("CRM create tag failed:", err);
     return res.status(500).json({ message: "Failed to create tag" });
+  }
+});
+
+// Update tag
+router.put("/tags/:id", auth, authorize("ADMIN"), async (req, res) => {
+  const nameInput = req.body.name;
+  const colorInput = req.body.color;
+  const name = nameInput === undefined ? undefined : String(nameInput || "").trim().slice(0, 50);
+  const color =
+    colorInput === undefined
+      ? undefined
+      : String(colorInput || "slate")
+          .trim()
+          .toLowerCase()
+          .slice(0, 20);
+
+  if (name !== undefined && !name) {
+    return res.status(400).json({ message: "Tag name cannot be empty" });
+  }
+
+  try {
+    const existing = await pool.query(
+      `SELECT id, name, color
+       FROM customer_tags
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!existing.rows[0]) {
+      return res.status(404).json({ message: "Tag not found" });
+    }
+
+    const current = existing.rows[0];
+    const nextName = name === undefined ? current.name : name;
+    const nextColor = color === undefined ? current.color : color || "slate";
+
+    const { rows } = await pool.query(
+      `UPDATE customer_tags
+       SET name = $1,
+           color = $2
+       WHERE id = $3
+       RETURNING id, name, color, created_at`,
+      [nextName, nextColor, req.params.id]
+    );
+    return res.json(rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ message: "Tag already exists" });
+    }
+    console.error("CRM update tag failed:", err);
+    return res.status(500).json({ message: "Failed to update tag" });
+  }
+});
+
+// Delete tag
+router.delete("/tags/:id", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      `DELETE FROM customer_tags
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ message: "Tag not found" });
+    }
+    return res.json({ message: "Tag deleted" });
+  } catch (err) {
+    console.error("CRM delete tag failed:", err);
+    return res.status(500).json({ message: "Failed to delete tag" });
   }
 });
 
@@ -766,6 +1102,121 @@ router.get("/segments/rfm", auth, authorize("ADMIN"), async (req, res) => {
   }
 });
 
+// Saved segment presets
+router.get("/segment-presets", auth, authorize("ADMIN"), async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, description, filter, is_active, created_by, updated_by, created_at, updated_at
+       FROM customer_segments
+       ORDER BY updated_at DESC, id DESC`
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error("CRM segment preset list failed:", err);
+    return res.status(500).json({ message: "Failed to fetch segment presets" });
+  }
+});
+
+router.post("/segment-presets", auth, authorize("ADMIN"), async (req, res) => {
+  const name = String(req.body.name || "").trim().slice(0, 120);
+  const description = req.body.description
+    ? String(req.body.description).trim().slice(0, 400)
+    : null;
+  const filter = normalizeAudienceFilter(req.body.filter || req.body.audience_filter || {});
+  const isActive = parseBoolean(req.body.is_active, true);
+
+  if (!name) {
+    return res.status(400).json({ message: "name is required" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO customer_segments (name, description, filter, is_active, created_by, updated_by)
+       VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+       RETURNING *`,
+      [name, description, JSON.stringify(filter), isActive, String(req.user.id), String(req.user.id)]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ message: "Segment preset name already exists" });
+    }
+    console.error("CRM segment preset create failed:", err);
+    return res.status(500).json({ message: "Failed to create segment preset" });
+  }
+});
+
+router.put("/segment-presets/:id", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const existing = await pool.query(
+      `SELECT *
+       FROM customer_segments
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!existing.rows[0]) {
+      return res.status(404).json({ message: "Segment preset not found" });
+    }
+    const current = existing.rows[0];
+
+    const nextName =
+      req.body.name === undefined ? current.name : String(req.body.name || "").trim().slice(0, 120);
+    const nextDescription =
+      req.body.description === undefined
+        ? current.description
+        : req.body.description
+          ? String(req.body.description).trim().slice(0, 400)
+          : null;
+    const nextFilter =
+      req.body.filter === undefined && req.body.audience_filter === undefined
+        ? current.filter || {}
+        : normalizeAudienceFilter(req.body.filter || req.body.audience_filter || {});
+    const nextActive =
+      req.body.is_active === undefined ? current.is_active : parseBoolean(req.body.is_active, true);
+
+    if (!nextName) {
+      return res.status(400).json({ message: "name cannot be empty" });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE customer_segments
+       SET name = $1,
+           description = $2,
+           filter = $3::jsonb,
+           is_active = $4,
+           updated_by = $5,
+           updated_at = NOW()
+       WHERE id = $6
+       RETURNING *`,
+      [nextName, nextDescription, JSON.stringify(nextFilter), nextActive, String(req.user.id), req.params.id]
+    );
+    return res.json(rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ message: "Segment preset name already exists" });
+    }
+    console.error("CRM segment preset update failed:", err);
+    return res.status(500).json({ message: "Failed to update segment preset" });
+  }
+});
+
+router.delete("/segment-presets/:id", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      `DELETE FROM customer_segments
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ message: "Segment preset not found" });
+    }
+    return res.json({ message: "Segment preset deleted" });
+  } catch (err) {
+    console.error("CRM segment preset delete failed:", err);
+    return res.status(500).json({ message: "Failed to delete segment preset" });
+  }
+});
+
 // Campaign audience preview
 router.post("/campaigns/audience-preview", auth, authorize("ADMIN"), async (req, res) => {
   try {
@@ -857,6 +1308,343 @@ router.post("/campaigns", auth, authorize("ADMIN"), async (req, res) => {
   } catch (err) {
     console.error("CRM campaign create failed:", err);
     return res.status(500).json({ message: "Failed to create campaign" });
+  }
+});
+
+// Campaign update
+router.put("/campaigns/:id", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const existing = await pool.query(
+      `SELECT *
+       FROM customer_campaigns
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!existing.rows[0]) {
+      return res.status(404).json({ message: "Campaign not found" });
+    }
+
+    const current = existing.rows[0];
+    const nextName =
+      req.body.name === undefined ? current.name : String(req.body.name || "").trim().slice(0, 120);
+    const nextChannel =
+      req.body.channel === undefined
+        ? String(current.channel || "SMS").trim().toUpperCase()
+        : String(req.body.channel || "SMS").trim().toUpperCase();
+    const nextMessage =
+      req.body.message === undefined ? current.message : String(req.body.message || "").trim();
+    const nextStatus =
+      req.body.status === undefined
+        ? String(current.status || "DRAFT").trim().toUpperCase()
+        : String(req.body.status || "DRAFT").trim().toUpperCase();
+    const nextAudienceFilter =
+      req.body.audience_filter === undefined && req.body.filter === undefined
+        ? current.audience_filter || {}
+        : normalizeAudienceFilter(req.body.audience_filter || req.body.filter || {});
+    const nextScheduledAt =
+      req.body.scheduled_at === undefined ? current.scheduled_at : req.body.scheduled_at || null;
+    const nextSentAt = req.body.sent_at === undefined ? current.sent_at : req.body.sent_at || null;
+
+    if (!nextName || !nextMessage) {
+      return res.status(400).json({ message: "name and message are required" });
+    }
+    if (!allowedChannels.has(nextChannel)) {
+      return res.status(400).json({ message: "Invalid channel" });
+    }
+    if (!allowedCampaignStatus.has(nextStatus)) {
+      return res.status(400).json({ message: "Invalid campaign status" });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE customer_campaigns
+       SET name = $1,
+           channel = $2,
+           audience_filter = $3::jsonb,
+           message = $4,
+           status = $5,
+           scheduled_at = $6,
+           sent_at = $7
+       WHERE id = $8
+       RETURNING *`,
+      [
+        nextName,
+        nextChannel,
+        JSON.stringify(nextAudienceFilter),
+        nextMessage,
+        nextStatus,
+        nextScheduledAt,
+        nextSentAt,
+        req.params.id,
+      ]
+    );
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("CRM campaign update failed:", err);
+    return res.status(500).json({ message: "Failed to update campaign" });
+  }
+});
+
+// Campaign delete
+router.delete("/campaigns/:id", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      `DELETE FROM customer_campaigns
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ message: "Campaign not found" });
+    }
+    return res.json({ message: "Campaign deleted" });
+  } catch (err) {
+    console.error("CRM campaign delete failed:", err);
+    return res.status(500).json({ message: "Failed to delete campaign" });
+  }
+});
+
+// Followup list
+router.get("/followups", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const status = String(req.query.status || "ALL").trim().toUpperCase();
+    const customerId = String(req.query.customer_id || "").trim();
+    const limit = parsePositiveInt(req.query.limit, 200, 1, 1000);
+    const includeCompleted = parseBoolean(req.query.include_completed, false);
+    const dueBeforeDays = parsePositiveInt(req.query.due_before_days, 0, 0, 3650);
+
+    const clauses = [];
+    const params = [];
+    if (status !== "ALL" && allowedFollowupStatus.has(status)) {
+      params.push(status);
+      clauses.push(`f.status = $${params.length}`);
+    } else if (!includeCompleted) {
+      clauses.push(`f.status <> 'COMPLETED'`);
+    }
+    if (customerId) {
+      params.push(customerId);
+      clauses.push(`f.customer_id = $${params.length}`);
+    }
+    if (dueBeforeDays > 0) {
+      params.push(dueBeforeDays);
+      clauses.push(
+        `(f.due_at IS NOT NULL AND f.due_at <= NOW() + (($${params.length}::text || ' days')::interval))`
+      );
+    }
+
+    params.push(limit);
+    const whereSql = clauses.length > 0 ? clauses.join(" AND ") : "true";
+
+    const { rows } = await pool.query(
+      `SELECT
+         f.id,
+         f.customer_id,
+         c.full_name AS customer_name,
+         c.phone AS customer_phone,
+         f.title,
+         f.note,
+         f.channel,
+         f.priority,
+         f.status,
+         f.due_at,
+         f.completed_at,
+         f.created_by,
+         f.updated_by,
+         f.created_at,
+         f.updated_at
+       FROM customer_followups f
+       JOIN customers c ON c.id = f.customer_id
+       WHERE ${whereSql}
+       ORDER BY
+         CASE
+           WHEN f.status = 'OPEN' THEN 0
+           WHEN f.status = 'IN_PROGRESS' THEN 1
+           WHEN f.status = 'CANCELLED' THEN 2
+           ELSE 3
+         END ASC,
+         f.due_at ASC NULLS LAST,
+         f.created_at DESC
+       LIMIT $${params.length}`,
+      params
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error("CRM followups list failed:", err);
+    return res.status(500).json({ message: "Failed to fetch followups" });
+  }
+});
+
+// Followup create
+router.post("/followups", auth, authorize("ADMIN"), async (req, res) => {
+  const customerId = String(req.body.customer_id || "").trim();
+  const title = String(req.body.title || "").trim().slice(0, 160);
+  const note = req.body.note ? String(req.body.note).trim().slice(0, 1200) : null;
+  const status = normalizeFollowupStatus(req.body.status, "OPEN");
+  const priority = normalizeFollowupPriority(req.body.priority, "MEDIUM");
+  const channel = normalizeFollowupChannel(req.body.channel, "PHONE");
+  const dueAt = req.body.due_at || null;
+
+  if (!customerId || !title) {
+    return res.status(400).json({ message: "customer_id and title are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const customer = await client.query(
+      `SELECT id
+       FROM customers
+       WHERE id = $1`,
+      [customerId]
+    );
+    if (!customer.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    const { rows } = await client.query(
+      `INSERT INTO customer_followups
+         (customer_id, title, note, channel, priority, status, due_at, completed_at, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING *`,
+      [
+        customerId,
+        title,
+        note,
+        channel,
+        priority,
+        status,
+        dueAt,
+        status === "COMPLETED" ? new Date().toISOString() : null,
+        String(req.user.id),
+        String(req.user.id),
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("CRM followup create failed:", err);
+    return res.status(500).json({ message: "Failed to create followup" });
+  } finally {
+    client.release();
+  }
+});
+
+// Followup update
+router.put("/followups/:id", auth, authorize("ADMIN"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `SELECT *
+       FROM customer_followups
+       WHERE id = $1
+       FOR UPDATE`,
+      [req.params.id]
+    );
+    if (!existing.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Followup not found" });
+    }
+    const current = existing.rows[0];
+
+    const nextCustomerId =
+      req.body.customer_id === undefined ? current.customer_id : String(req.body.customer_id || "").trim();
+    const nextTitle =
+      req.body.title === undefined ? current.title : String(req.body.title || "").trim().slice(0, 160);
+    const nextNote =
+      req.body.note === undefined ? current.note : req.body.note ? String(req.body.note).trim().slice(0, 1200) : null;
+    const nextStatus =
+      req.body.status === undefined
+        ? normalizeFollowupStatus(current.status, "OPEN")
+        : normalizeFollowupStatus(req.body.status, "OPEN");
+    const nextPriority =
+      req.body.priority === undefined
+        ? normalizeFollowupPriority(current.priority, "MEDIUM")
+        : normalizeFollowupPriority(req.body.priority, "MEDIUM");
+    const nextChannel =
+      req.body.channel === undefined
+        ? normalizeFollowupChannel(current.channel, "PHONE")
+        : normalizeFollowupChannel(req.body.channel, "PHONE");
+    const nextDueAt = req.body.due_at === undefined ? current.due_at : req.body.due_at || null;
+
+    if (!nextCustomerId || !nextTitle) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "customer_id and title are required" });
+    }
+
+    const customer = await client.query(
+      `SELECT id
+       FROM customers
+       WHERE id = $1`,
+      [nextCustomerId]
+    );
+    if (!customer.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    const nextCompletedAt =
+      nextStatus === "COMPLETED"
+        ? current.completed_at || new Date().toISOString()
+        : req.body.completed_at === undefined
+          ? null
+          : req.body.completed_at || null;
+
+    const { rows } = await client.query(
+      `UPDATE customer_followups
+       SET customer_id = $1,
+           title = $2,
+           note = $3,
+           channel = $4,
+           priority = $5,
+           status = $6,
+           due_at = $7,
+           completed_at = $8,
+           updated_by = $9,
+           updated_at = NOW()
+       WHERE id = $10
+       RETURNING *`,
+      [
+        nextCustomerId,
+        nextTitle,
+        nextNote,
+        nextChannel,
+        nextPriority,
+        nextStatus,
+        nextDueAt,
+        nextCompletedAt,
+        String(req.user.id),
+        req.params.id,
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.json(rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("CRM followup update failed:", err);
+    return res.status(500).json({ message: "Failed to update followup" });
+  } finally {
+    client.release();
+  }
+});
+
+// Followup delete
+router.delete("/followups/:id", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      `DELETE FROM customer_followups
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ message: "Followup not found" });
+    }
+    return res.json({ message: "Followup deleted" });
+  } catch (err) {
+    console.error("CRM followup delete failed:", err);
+    return res.status(500).json({ message: "Failed to delete followup" });
   }
 });
 

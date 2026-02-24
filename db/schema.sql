@@ -3,7 +3,8 @@ CREATE TABLE IF NOT EXISTS users (
   username VARCHAR(50) UNIQUE NOT NULL,
   "passwordHash" TEXT NOT NULL,
   role VARCHAR(20) NOT NULL CHECK (role IN ('ADMIN', 'CASHIER')),
-  "isActive" BOOLEAN DEFAULT TRUE
+  "isActive" BOOLEAN DEFAULT TRUE,
+  is_super_admin BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -18,6 +19,7 @@ CREATE TABLE IF NOT EXISTS products (
 
 CREATE TABLE IF NOT EXISTS orders (
   id SERIAL PRIMARY KEY,
+  invoice_number VARCHAR(20),
   total NUMERIC(10,2) NOT NULL,
   payment_method VARCHAR(20) NOT NULL,
   customer_id TEXT,
@@ -27,6 +29,8 @@ CREATE TABLE IF NOT EXISTS orders (
   channel VARCHAR(20) DEFAULT 'POS',
   loyalty_points_redeemed INT DEFAULT 0,
   loyalty_discount_amount NUMERIC(10,2) DEFAULT 0,
+  manual_discount_amount NUMERIC(10,2) DEFAULT 0,
+  total_discount_amount NUMERIC(10,2) DEFAULT 0,
   status VARCHAR(24) NOT NULL DEFAULT 'COMPLETED',
   refunded_amount NUMERIC(10,2) NOT NULL DEFAULT 0,
   void_reason TEXT,
@@ -238,7 +242,36 @@ CREATE TABLE IF NOT EXISTS customer_campaigns (
   sent_at TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS customer_segments (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(120) NOT NULL UNIQUE,
+  description TEXT,
+  filter JSONB NOT NULL DEFAULT '{}'::jsonb,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by TEXT,
+  updated_by TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS customer_followups (
+  id SERIAL PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  title VARCHAR(160) NOT NULL,
+  note TEXT,
+  channel VARCHAR(20) NOT NULL DEFAULT 'PHONE',
+  priority VARCHAR(20) NOT NULL DEFAULT 'MEDIUM',
+  status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+  due_at TIMESTAMP,
+  completed_at TIMESTAMP,
+  created_by TEXT,
+  updated_by TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
 ALTER TABLE orders
+  ADD COLUMN IF NOT EXISTS invoice_number VARCHAR(20),
   ADD COLUMN IF NOT EXISTS customer_id TEXT,
   ADD COLUMN IF NOT EXISTS customer_name VARCHAR(120),
   ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(30),
@@ -246,6 +279,8 @@ ALTER TABLE orders
   ADD COLUMN IF NOT EXISTS channel VARCHAR(20),
   ADD COLUMN IF NOT EXISTS loyalty_points_redeemed INT DEFAULT 0,
   ADD COLUMN IF NOT EXISTS loyalty_discount_amount NUMERIC(10,2) DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS manual_discount_amount NUMERIC(10,2) DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS total_discount_amount NUMERIC(10,2) DEFAULT 0,
   ADD COLUMN IF NOT EXISTS status VARCHAR(24) DEFAULT 'COMPLETED',
   ADD COLUMN IF NOT EXISTS refunded_amount NUMERIC(10,2) DEFAULT 0,
   ADD COLUMN IF NOT EXISTS void_reason TEXT,
@@ -260,7 +295,11 @@ CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(LOWER(full_name));
 CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_customer_phone ON orders(customer_phone);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_invoice_number_unique ON orders(invoice_number);
 CREATE INDEX IF NOT EXISTS idx_loyalty_customer_id ON customer_loyalty_txns(customer_id);
+CREATE INDEX IF NOT EXISTS idx_customer_segments_active_updated ON customer_segments(is_active, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customer_followups_customer_status_due ON customer_followups(customer_id, status, due_at);
+CREATE INDEX IF NOT EXISTS idx_customer_followups_due_status ON customer_followups(due_at, status);
 CREATE INDEX IF NOT EXISTS idx_held_orders_created_at ON held_orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_held_orders_created_by ON held_orders(created_by);
 CREATE INDEX IF NOT EXISTS idx_expenses_incurred_at ON expenses(incurred_at DESC);

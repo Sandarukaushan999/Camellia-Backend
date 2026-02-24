@@ -1,8 +1,15 @@
 import express from "express";
 import multer from "multer";
+import bcrypt from "bcrypt";
 import auth from "../middleware/auth.js";
-import authorize from "../middleware/authorize.js";
+import authorize, { authorizePermissions } from "../middleware/authorize.js";
 import pool from "../db.js";
+import { runBackupValidationJob } from "../services/backupJobs.js";
+import {
+  PERMISSION_DEFINITIONS,
+  getDefaultPermissionKeysForBaseRole,
+  normalizePermissionKeys,
+} from "../config/accessControl.js";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -27,6 +34,24 @@ const BACKUP_TABLES = [
   "purchase_order_items",
   "goods_receipts",
   "goods_receipt_items",
+  "branches",
+  "branch_users",
+  "branch_inventory",
+  "branch_products",
+  "stock_batches",
+  "stock_movements",
+  "stock_transfers",
+  "stock_transfer_items",
+  "purchase_requisitions",
+  "purchase_requisition_items",
+  "stock_count_sessions",
+  "stock_count_items",
+  "employees",
+  "attendance_logs",
+  "report_templates",
+  "forecast_snapshots",
+  "report_export_jobs",
+  "backup_jobs",
   "audit_logs",
   "orders",
   "order_items",
@@ -45,15 +70,33 @@ const RESTORE_ORDER = [
   "cash_shifts",
   "expenses",
   "goods_receipts",
+  "branches",
+  "stock_transfers",
   "product_ingredients",
   "inventory_alerts",
+  "branch_inventory",
+  "branch_products",
+  "stock_batches",
+  "stock_movements",
+  "purchase_requisitions",
+  "employees",
+  "stock_count_sessions",
   "purchase_order_items",
   "goods_receipt_items",
+  "stock_transfer_items",
+  "purchase_requisition_items",
+  "stock_count_items",
+  "attendance_logs",
+  "report_templates",
+  "forecast_snapshots",
+  "report_export_jobs",
+  "backup_jobs",
   "audit_logs",
   "customer_contacts",
   "customer_notes",
   "customer_tag_map",
   "customer_loyalty_txns",
+  "branch_users",
   "order_items",
 ];
 
@@ -70,6 +113,22 @@ const RESETTABLE_TABLES = [
   "customer_campaigns",
   "goods_receipt_items",
   "goods_receipts",
+  "stock_transfer_items",
+  "stock_transfers",
+  "stock_movements",
+  "stock_batches",
+  "purchase_requisition_items",
+  "purchase_requisitions",
+  "stock_count_items",
+  "stock_count_sessions",
+  "branch_inventory",
+  "branch_products",
+  "branch_users",
+  "attendance_logs",
+  "employees",
+  "report_templates",
+  "forecast_snapshots",
+  "report_export_jobs",
   "purchase_order_items",
   "purchase_orders",
   "suppliers",
@@ -79,6 +138,7 @@ const RESETTABLE_TABLES = [
   "customer_tags",
   "customers",
   "products",
+  "backup_jobs",
   "held_orders",
 ];
 
@@ -96,6 +156,255 @@ function parseMoney(value, fallback = 0) {
     return fallback;
   }
   return Math.round(parsed * 100) / 100;
+}
+
+function parseBranchId(value, fallback = 1) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+const USER_BASE_ROLES = new Set(["ADMIN", "CASHIER"]);
+
+function normalizeBaseRole(value, fallback = null) {
+  const normalized = String(value || "")
+    .trim()
+    .toUpperCase();
+  if (USER_BASE_ROLES.has(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizeUsername(value) {
+  const username = String(value || "").trim().slice(0, 50);
+  if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) {
+    return null;
+  }
+  return username;
+}
+
+function normalizeRoleName(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+function parseOptionalRoleId(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return NaN;
+  }
+  return parsed;
+}
+
+function normalizeUserId(value) {
+  const userId = String(value || "").trim();
+  if (!userId || userId.length > 80) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9-]+$/.test(userId)) {
+    return null;
+  }
+  return userId;
+}
+
+function mapAccessRoleRow(row) {
+  const permissions = normalizePermissionKeys(row?.permissions || []);
+  return {
+    id: Number(row.id),
+    name: row.name,
+    description: row.description || "",
+    base_role: String(row.base_role || "ADMIN").toUpperCase(),
+    is_system: row.is_system === true,
+    is_active: row.is_active !== false,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    permissions,
+    assigned_user_count: Number(row.assigned_user_count || 0),
+  };
+}
+
+function mapUserAccessRow(row) {
+  const hasCustomRole =
+    Number.isFinite(Number(row.custom_role_id)) &&
+    row.custom_role_is_active !== false;
+  const effectivePermissions = hasCustomRole
+    ? normalizePermissionKeys(row.custom_permissions)
+    : getDefaultPermissionKeysForBaseRole(row.role);
+  return {
+    id: row.id,
+    username: row.username,
+    role: String(row.role || "").toUpperCase(),
+    is_active: row.is_active !== false,
+    is_super_admin: row.is_super_admin === true,
+    custom_role_id: row.custom_role_id ? Number(row.custom_role_id) : null,
+    custom_role_name: row.custom_role_name || null,
+    permissions: effectivePermissions,
+  };
+}
+
+async function fetchAccessRoleById(client, roleId) {
+  const { rows } = await client.query(
+    `SELECT
+       ar.id,
+       ar.name,
+       ar.description,
+       ar.base_role,
+       ar.is_system,
+       ar.is_active,
+       ar.created_at,
+       ar.updated_at,
+       COALESCE(
+         ARRAY_AGG(DISTINCT arp.permission_key) FILTER (WHERE arp.permission_key IS NOT NULL),
+         ARRAY[]::text[]
+       ) AS permissions,
+       COUNT(DISTINCT u.id) AS assigned_user_count
+     FROM access_roles ar
+     LEFT JOIN access_role_permissions arp ON arp.role_id = ar.id
+     LEFT JOIN users u ON u.custom_role_id = ar.id
+     WHERE ar.id = $1
+     GROUP BY ar.id`,
+    [roleId]
+  );
+  return rows[0] ? mapAccessRoleRow(rows[0]) : null;
+}
+
+async function listAccessRoles(client) {
+  const { rows } = await client.query(
+    `SELECT
+       ar.id,
+       ar.name,
+       ar.description,
+       ar.base_role,
+       ar.is_system,
+       ar.is_active,
+       ar.created_at,
+       ar.updated_at,
+       COALESCE(
+         ARRAY_AGG(DISTINCT arp.permission_key) FILTER (WHERE arp.permission_key IS NOT NULL),
+         ARRAY[]::text[]
+       ) AS permissions,
+       COUNT(DISTINCT u.id) AS assigned_user_count
+     FROM access_roles ar
+     LEFT JOIN access_role_permissions arp ON arp.role_id = ar.id
+     LEFT JOIN users u ON u.custom_role_id = ar.id
+     GROUP BY ar.id
+     ORDER BY ar.is_system DESC, ar.base_role ASC, ar.name ASC`
+  );
+  return rows.map(mapAccessRoleRow);
+}
+
+async function resolveDefaultSystemRoleId(client, baseRole) {
+  const normalizedBaseRole = String(baseRole || "").toUpperCase();
+  const preferredName =
+    normalizedBaseRole === "ADMIN"
+      ? "Admin Default"
+      : normalizedBaseRole === "CASHIER"
+      ? "Cashier Default"
+      : null;
+  if (preferredName) {
+    const preferredRes = await client.query(
+      `SELECT id
+       FROM access_roles
+       WHERE is_system = TRUE
+         AND is_active = TRUE
+         AND base_role = $1
+         AND name = $2
+       ORDER BY id ASC
+       LIMIT 1`,
+      [normalizedBaseRole, preferredName]
+    );
+    if (preferredRes.rows[0]?.id) {
+      return Number(preferredRes.rows[0].id);
+    }
+  }
+
+  const fallbackRes = await client.query(
+    `SELECT id
+     FROM access_roles
+     WHERE is_system = TRUE
+       AND is_active = TRUE
+       AND base_role = $1
+     ORDER BY id ASC
+     LIMIT 1`,
+    [normalizedBaseRole]
+  );
+  return fallbackRes.rows[0]?.id ? Number(fallbackRes.rows[0].id) : null;
+}
+
+async function resolveAssignableRole(client, roleId, expectedBaseRole) {
+  const { rows } = await client.query(
+    `SELECT id, name, base_role, is_system, is_active
+     FROM access_roles
+     WHERE id = $1
+     LIMIT 1`,
+    [roleId]
+  );
+  const role = rows[0];
+  if (!role) {
+    return { error: "Role not found", status: 404 };
+  }
+  if (role.is_active === false) {
+    return { error: "Role is inactive", status: 409 };
+  }
+  if (String(role.base_role || "").toUpperCase() !== expectedBaseRole) {
+    return { error: "Role base does not match selected user role", status: 400 };
+  }
+  return {
+    id: Number(role.id),
+    name: role.name,
+    base_role: String(role.base_role || "").toUpperCase(),
+    is_system: role.is_system === true,
+    is_active: role.is_active !== false,
+  };
+}
+
+async function resolveSystemRoleIdByName(client, roleName, fallbackBaseRole = "ADMIN") {
+  const { rows } = await client.query(
+    `SELECT id
+     FROM access_roles
+     WHERE is_system = TRUE
+       AND is_active = TRUE
+       AND name = $1
+     ORDER BY id ASC
+     LIMIT 1`,
+    [roleName]
+  );
+  if (rows[0]?.id) {
+    return Number(rows[0].id);
+  }
+  return resolveDefaultSystemRoleId(client, fallbackBaseRole);
+}
+
+async function fetchUserSecurityContext(client, userId, lockRow = false) {
+  const { rows } = await client.query(
+    `SELECT
+       id::text AS id,
+       username,
+       role,
+       "isActive" AS is_active,
+       custom_role_id,
+       COALESCE(is_super_admin, FALSE) AS is_super_admin
+     FROM users
+     WHERE id::text = $1
+     LIMIT 1
+     ${lockRow ? "FOR UPDATE" : ""}`,
+    [String(userId)]
+  );
+  return rows[0] || null;
+}
+
+function normalizeApprovalPin(value) {
+  return String(value || "")
+    .replace(/[^\d]/g, "")
+    .slice(0, 12);
 }
 
 function normalizeProductImageUrl(value) {
@@ -140,6 +449,12 @@ function buildReportFilter(reqQuery = {}) {
   const days = parsePositiveInt(reqQuery.days, 30, 1, 3650);
   const orderType = normalizeOrderType(reqQuery.orderType);
   const paymentMethod = normalizePaymentMethod(reqQuery.paymentMethod);
+  const branchId = parsePositiveInt(
+    reqQuery.branch_id ?? reqQuery.branchId,
+    NaN,
+    1,
+    1_000_000
+  );
   const params = [days];
   const conditions = [
     "created_at >= CURRENT_DATE - (($1::text || ' days')::interval)",
@@ -153,9 +468,14 @@ function buildReportFilter(reqQuery = {}) {
     params.push(paymentMethod);
     conditions.push(`payment_method = $${params.length}`);
   }
+  if (Number.isFinite(branchId)) {
+    params.push(branchId);
+    conditions.push(`COALESCE(branch_id, 1) = $${params.length}`);
+  }
 
   return {
     days,
+    branchId: Number.isFinite(branchId) ? branchId : null,
     params,
     whereSql: conditions.join(" AND "),
   };
@@ -187,6 +507,30 @@ async function writeAuditLog(clientOrPool, payload) {
      VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
     [action, entityType, entityId, actorId, actorRole, JSON.stringify(meta)]
   );
+}
+
+async function resolveActiveBranchId(client, requestedBranchId = 1) {
+  const branchId = parseBranchId(requestedBranchId, 1);
+  const branchRes = await client.query(
+    `SELECT id
+     FROM branches
+     WHERE id = $1
+       AND is_active = TRUE
+     LIMIT 1`,
+    [branchId]
+  );
+  if (branchRes.rows[0]) {
+    return Number(branchRes.rows[0].id);
+  }
+
+  const fallbackRes = await client.query(
+    `SELECT id
+     FROM branches
+     WHERE is_active = TRUE
+     ORDER BY id ASC
+     LIMIT 1`
+  );
+  return Number(fallbackRes.rows[0]?.id || 1);
 }
 
 function quoteIdentifier(value) {
@@ -360,10 +704,34 @@ async function restoreFromParsedRows(client, parsedRows) {
 }
 
 // List products (ADMIN only for management) - includes stock for inventory
-router.get("/products", auth, authorize("ADMIN"), async (_req, res) => {
+router.get("/products", auth, authorize("ADMIN"), async (req, res) => {
   try {
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
     const { rows } = await pool.query(
-      'SELECT id, name, price, category, image_url, "isActive" as is_active, stock FROM products ORDER BY name'
+      hasBranchFilter
+        ? `SELECT
+             p.id,
+             p.name,
+             p.price,
+             p.category,
+             p.image_url,
+             p."isActive" AS is_active,
+             p.stock,
+             bp.price_override,
+             bp.is_active AS branch_is_active,
+             COALESCE(bp.price_override, p.price) AS effective_price,
+             CASE
+               WHEN bp.id IS NULL THEN p."isActive"
+               ELSE bp.is_active
+             END AS effective_active
+           FROM products p
+           LEFT JOIN branch_products bp
+             ON bp.branch_id = $1
+            AND bp.product_id = p.id::text
+           ORDER BY p.name`
+        : 'SELECT id, name, price, category, image_url, "isActive" as is_active, stock FROM products ORDER BY name',
+      hasBranchFilter ? [branchId] : []
     );
     return res.json(rows);
   } catch (err) {
@@ -374,10 +742,33 @@ router.get("/products", auth, authorize("ADMIN"), async (_req, res) => {
 });
 
 // Get active products for POS (both ADMIN and CASHIER)
-router.get("/products/pos", auth, authorize("ADMIN", "CASHIER"), async (_req, res) => {
+router.get("/products/pos", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
   try {
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
     const { rows } = await pool.query(
-      'SELECT id, name, price, category, image_url FROM products WHERE "isActive" = true ORDER BY category, name'
+      hasBranchFilter
+        ? `SELECT
+             p.id,
+             p.name,
+             COALESCE(bp.price_override, p.price) AS price,
+             p.category,
+             p.image_url,
+             p.price AS base_price,
+             bp.price_override,
+             CASE
+               WHEN bp.id IS NULL THEN p."isActive"
+               ELSE bp.is_active
+             END AS is_active
+           FROM products p
+           LEFT JOIN branch_products bp
+             ON bp.branch_id = $1
+            AND bp.product_id = p.id::text
+           WHERE p."isActive" = TRUE
+             AND (bp.id IS NULL OR bp.is_active = TRUE)
+           ORDER BY p.category, p.name`
+        : 'SELECT id, name, price, category, image_url FROM products WHERE "isActive" = true ORDER BY category, name',
+      hasBranchFilter ? [branchId] : []
     );
     return res.json(rows);
   } catch (err) {
@@ -477,23 +868,32 @@ router.delete("/products/:id", auth, authorize("ADMIN"), async (req, res) => {
 });
 
 // Dashboard stats
-router.get("/dashboard/stats", auth, authorize("ADMIN"), async (_req, res) => {
+router.get("/dashboard/stats", auth, authorize("ADMIN"), async (req, res) => {
   try {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const yesterday = new Date(today);
     yesterday.setDate(yesterday.getDate() - 1);
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
 
     // Today's sales
     const todaySales = await pool.query(
-      "SELECT COALESCE(SUM(total), 0) as total, COUNT(*) as count FROM orders WHERE created_at >= $1",
-      [today]
+      `SELECT COALESCE(SUM(total), 0) as total, COUNT(*) as count
+       FROM orders
+       WHERE created_at >= $1
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}`,
+      hasBranchFilter ? [today, branchId] : [today]
     );
 
     // Yesterday's sales for comparison
     const yesterdaySales = await pool.query(
-      "SELECT COALESCE(SUM(total), 0) as total FROM orders WHERE created_at >= $1 AND created_at < $2",
-      [yesterday, today]
+      `SELECT COALESCE(SUM(total), 0) as total
+       FROM orders
+       WHERE created_at >= $1
+         AND created_at < $2
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $3" : ""}`,
+      hasBranchFilter ? [yesterday, today, branchId] : [yesterday, today]
     );
 
     const todayTotal = parseFloat(todaySales.rows[0].total || 0);
@@ -504,13 +904,20 @@ router.get("/dashboard/stats", auth, authorize("ADMIN"), async (_req, res) => {
 
     // Active orders (last 30 minutes)
     const activeOrders = await pool.query(
-      "SELECT COUNT(*) as count FROM orders WHERE created_at >= NOW() - INTERVAL '30 minutes'"
+      `SELECT COUNT(*) as count
+       FROM orders
+       WHERE created_at >= NOW() - INTERVAL '30 minutes'
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $1" : ""}`,
+      hasBranchFilter ? [branchId] : []
     );
 
     // Approximate net profit based on today's recorded expenses.
     const expenseRes = await pool.query(
-      "SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE incurred_at >= $1",
-      [today]
+      `SELECT COALESCE(SUM(amount), 0) AS total
+       FROM expenses
+       WHERE incurred_at >= $1
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}`,
+      hasBranchFilter ? [today, branchId] : [today]
     );
     const expensesToday = parseFloat(expenseRes.rows[0]?.total || 0);
     const netProfit = todayTotal - expensesToday;
@@ -523,6 +930,7 @@ router.get("/dashboard/stats", auth, authorize("ADMIN"), async (_req, res) => {
       netProfit: netProfit.toFixed(2),
       expensesToday: expensesToday.toFixed(2),
       activeOrders: parseInt(activeOrders.rows[0].count || 0),
+      branchId: hasBranchFilter ? branchId : null,
     });
   } catch (err) {
     return res.status(500).json({ message: "Failed to fetch dashboard stats" });
@@ -536,14 +944,17 @@ router.get("/dashboard/sales-chart", auth, authorize("ADMIN"), async (req, res) 
     const days = Number.isFinite(requestedDays)
       ? Math.min(Math.max(requestedDays, 7), 365)
       : 7;
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
 
     const { rows } = await pool.query(
       `SELECT DATE(created_at) as day, COALESCE(SUM(total), 0) as total 
        FROM orders 
        WHERE created_at >= CURRENT_DATE - (($1 || ' days')::interval)
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}
        GROUP BY DATE(created_at) 
        ORDER BY day ASC`,
-      [days]
+      hasBranchFilter ? [days, branchId] : [days]
     );
     return res.json(rows.map(r => ({ day: r.day, total: parseFloat(r.total || 0) })));
   } catch (err) {
@@ -552,17 +963,20 @@ router.get("/dashboard/sales-chart", auth, authorize("ADMIN"), async (req, res) 
 });
 
 // Order breakdown by type
-router.get("/dashboard/order-breakdown", auth, authorize("ADMIN"), async (_req, res) => {
+router.get("/dashboard/order-breakdown", auth, authorize("ADMIN"), async (req, res) => {
   try {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
     
     const { rows } = await pool.query(
       `SELECT payment_method, COUNT(*) as count, SUM(total) as total 
        FROM orders 
        WHERE created_at >= $1 
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}
        GROUP BY payment_method`,
-      [today]
+      hasBranchFilter ? [today, branchId] : [today]
     );
 
     const total = rows.reduce((sum, r) => sum + parseInt(r.count), 0);
@@ -580,10 +994,12 @@ router.get("/dashboard/order-breakdown", auth, authorize("ADMIN"), async (_req, 
 });
 
 // Top selling items
-router.get("/dashboard/top-items", auth, authorize("ADMIN"), async (_req, res) => {
+router.get("/dashboard/top-items", auth, authorize("ADMIN"), async (req, res) => {
   try {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
 
     const { rows } = await pool.query(
       `SELECT p.name, SUM(oi.qty) as total_qty, SUM(oi.qty * oi.price) as revenue
@@ -591,10 +1007,11 @@ router.get("/dashboard/top-items", auth, authorize("ADMIN"), async (_req, res) =
        JOIN orders o ON o.id = oi.order_id
        JOIN products p ON p.id = oi.product_id
        WHERE o.created_at >= $1
+         ${hasBranchFilter ? "AND COALESCE(o.branch_id, 1) = $2" : ""}
        GROUP BY p.name
        ORDER BY total_qty DESC
        LIMIT 5`,
-      [today]
+      hasBranchFilter ? [today, branchId] : [today]
     );
 
     return res.json(rows.map(r => ({
@@ -608,13 +1025,17 @@ router.get("/dashboard/top-items", auth, authorize("ADMIN"), async (_req, res) =
 });
 
 // Recent orders
-router.get("/dashboard/recent-orders", auth, authorize("ADMIN"), async (_req, res) => {
+router.get("/dashboard/recent-orders", auth, authorize("ADMIN"), async (req, res) => {
   try {
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
     const { rows } = await pool.query(
       `SELECT id, total, payment_method, created_at 
        FROM orders 
+       ${hasBranchFilter ? "WHERE COALESCE(branch_id, 1) = $1" : ""}
        ORDER BY created_at DESC 
-       LIMIT 10`
+       LIMIT 10`,
+      hasBranchFilter ? [branchId] : []
     );
 
     return res.json(rows.map(r => ({
@@ -625,6 +1046,169 @@ router.get("/dashboard/recent-orders", auth, authorize("ADMIN"), async (_req, re
     })));
   } catch (err) {
     return res.status(500).json({ message: "Failed to fetch recent orders" });
+  }
+});
+
+// Branch sales comparison
+router.get("/dashboard/branch-comparison", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 30, 1, 3650);
+    const limit = parsePositiveInt(req.query.limit, 20, 1, 200);
+    const { rows } = await pool.query(
+      `SELECT
+         b.id AS branch_id,
+         b.code AS branch_code,
+         b.name AS branch_name,
+         COUNT(o.id) AS order_count,
+         COALESCE(SUM(o.total), 0) AS sales_total,
+         COALESCE(AVG(o.total), 0) AS avg_order_value
+       FROM branches b
+       LEFT JOIN orders o
+         ON COALESCE(o.branch_id, 1) = b.id
+        AND o.created_at >= NOW() - (($1::text || ' days')::interval)
+       GROUP BY b.id, b.code, b.name
+       ORDER BY sales_total DESC
+       LIMIT $2`,
+      [days, limit]
+    );
+    return res.json(
+      rows.map((row) => ({
+        branch_id: Number(row.branch_id),
+        branch_code: row.branch_code,
+        branch_name: row.branch_name,
+        order_count: parseInt(row.order_count || 0, 10),
+        sales_total: parseFloat(row.sales_total || 0),
+        avg_order_value: parseFloat(row.avg_order_value || 0),
+      }))
+    );
+  } catch (err) {
+    console.error("Failed to fetch branch comparison:", err);
+    return res.status(500).json({ message: "Failed to fetch branch comparison" });
+  }
+});
+
+// Sales ledger with invoice numbers + item details
+router.get("/sales", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 30, 1, 3650);
+    const limit = parsePositiveInt(req.query.limit, 200, 1, 1000);
+    const offset = parsePositiveInt(req.query.offset, 0, 0, 1_000_000);
+    const branchId = parsePositiveInt(
+      req.query.branch_id ?? req.query.branchId,
+      NaN,
+      1,
+      1_000_000
+    );
+    const paymentMethod = normalizePaymentMethod(
+      req.query.payment_method ?? req.query.paymentMethod
+    );
+    const search = String(req.query.search || "")
+      .trim()
+      .slice(0, 80);
+
+    const params = [days];
+    const where = [
+      "o.created_at >= NOW() - (($1::text || ' days')::interval)",
+    ];
+
+    if (Number.isFinite(branchId)) {
+      params.push(branchId);
+      where.push(`COALESCE(o.branch_id, 1) = $${params.length}`);
+    }
+
+    if (paymentMethod) {
+      params.push(paymentMethod);
+      where.push(`o.payment_method = $${params.length}`);
+    }
+
+    if (search) {
+      const escaped = search.replace(/[\\%_]/g, "\\$&");
+      params.push(`%${escaped}%`);
+      where.push(`(
+        COALESCE(o.invoice_number, '') ILIKE $${params.length} ESCAPE '\\'
+        OR COALESCE(o.customer_name, '') ILIKE $${params.length} ESCAPE '\\'
+        OR COALESCE(o.customer_phone, '') ILIKE $${params.length} ESCAPE '\\'
+      )`);
+    }
+
+    params.push(limit);
+    const limitParam = params.length;
+    params.push(offset);
+    const offsetParam = params.length;
+
+    const { rows } = await pool.query(
+      `SELECT
+         o.id,
+         COALESCE(o.invoice_number, CONCAT('VOXO', LPAD(o.id::text, 6, '0'))) AS invoice_number,
+         o.created_at,
+         o.customer_name,
+         o.customer_phone,
+         o.total,
+         o.payment_method,
+         o.loyalty_points_redeemed,
+         o.loyalty_discount_amount,
+         o.manual_discount_amount,
+         o.total_discount_amount,
+         o.status,
+         o.refunded_amount,
+         COALESCE(
+           json_agg(
+             jsonb_build_object(
+               'product_id', oi.product_id,
+               'name', COALESCE(p.name, CONCAT('Item ', oi.product_id::text)),
+               'qty', oi.qty,
+               'unit_price', oi.price,
+               'line_total', (COALESCE(oi.qty::numeric, 0) * COALESCE(oi.price, 0))
+             )
+             ORDER BY oi.id
+           ) FILTER (WHERE oi.id IS NOT NULL),
+           '[]'::json
+         ) AS items,
+         COALESCE(SUM(COALESCE(oi.qty::numeric, 0) * COALESCE(oi.price, 0)), 0) AS gross_items_total
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id
+       LEFT JOIN products p ON p.id = oi.product_id
+       WHERE ${where.join(" AND ")}
+       GROUP BY o.id
+       ORDER BY o.created_at DESC
+       LIMIT $${limitParam}
+       OFFSET $${offsetParam}`,
+      params
+    );
+
+    return res.json(
+      rows.map((row) => {
+        const items = Array.isArray(row.items) ? row.items : [];
+        return {
+          id: Number(row.id),
+          invoice_number: row.invoice_number,
+          created_at: row.created_at,
+          customer_name: row.customer_name || null,
+          customer_phone: row.customer_phone || null,
+          total: parseFloat(row.total || 0),
+          payment_method: row.payment_method || "OTHER",
+          discount_amount: parseFloat(
+            row.total_discount_amount ?? row.loyalty_discount_amount ?? 0
+          ),
+          manual_discount_amount: parseFloat(row.manual_discount_amount || 0),
+          loyalty_discount_amount: parseFloat(row.loyalty_discount_amount || 0),
+          loyalty_points_redeemed: parseInt(row.loyalty_points_redeemed || 0, 10),
+          status: row.status || "COMPLETED",
+          refunded_amount: parseFloat(row.refunded_amount || 0),
+          gross_items_total: parseFloat(row.gross_items_total || 0),
+          items: items.map((item) => ({
+            product_id: item.product_id,
+            name: item.name,
+            qty: parseFloat(item.qty || 0),
+            unit_price: parseFloat(item.unit_price || 0),
+            line_total: parseFloat(item.line_total || 0),
+          })),
+        };
+      })
+    );
+  } catch (err) {
+    console.error("Failed to fetch sales ledger:", err);
+    return res.status(500).json({ message: "Failed to fetch sales ledger" });
   }
 });
 
@@ -666,6 +1250,7 @@ router.get("/reports/sales/details", auth, authorize("ADMIN"), async (req, res) 
          id,
          total,
          payment_method,
+         branch_id,
          order_type,
          channel,
          loyalty_points_redeemed,
@@ -686,6 +1271,7 @@ router.get("/reports/sales/details", auth, authorize("ADMIN"), async (req, res) 
         id: row.id,
         total: parseFloat(row.total || 0),
         paymentMethod: row.payment_method,
+        branchId: row.branch_id ? Number(row.branch_id) : null,
         orderType: row.order_type,
         channel: row.channel,
         loyaltyPointsRedeemed: parseInt(row.loyalty_points_redeemed || 0, 10),
@@ -774,15 +1360,927 @@ router.get("/reports/order-type-breakdown", auth, authorize("ADMIN"), async (req
   }
 });
 
-// Shift management
-router.get("/shifts/current", auth, authorize("ADMIN"), async (_req, res) => {
+// Manager approval PIN (used for refund/void approval)
+router.post("/security/approval-pin", auth, authorize("ADMIN"), async (req, res) => {
+  const pin = normalizeApprovalPin(req.body?.pin);
+  const confirmPin = normalizeApprovalPin(req.body?.confirm_pin);
+
+  if (!pin || pin.length < 4) {
+    return res.status(400).json({ message: "pin must be at least 4 digits" });
+  }
+  if (confirmPin && confirmPin !== pin) {
+    return res.status(400).json({ message: "confirm_pin does not match pin" });
+  }
+
+  const hash = await bcrypt.hash(pin, 10);
+  const client = await pool.connect();
   try {
+    await client.query("BEGIN");
+    const updateRes = await client.query(
+      `UPDATE users
+       SET approval_pin_hash = $1,
+           approval_pin_updated_at = NOW()
+       WHERE id::text = $2
+       RETURNING id::text AS id`,
+      [hash, String(req.user.id)]
+    );
+    if (!updateRes.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await writeAuditLog(client, {
+      action: "SECURITY_APPROVAL_PIN_SET",
+      entity_type: "user",
+      entity_id: updateRes.rows[0].id,
+      actor_id: req.user.id,
+      actor_role: req.user.role,
+      payload: {},
+    });
+
+    await client.query("COMMIT");
+    return res.json({ message: "Approval PIN updated successfully" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Failed to set approval pin:", err);
+    return res.status(500).json({ message: "Failed to update approval pin" });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete("/security/approval-pin", auth, authorize("ADMIN"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const updateRes = await client.query(
+      `UPDATE users
+       SET approval_pin_hash = NULL,
+           approval_pin_updated_at = NOW()
+       WHERE id::text = $1
+       RETURNING id::text AS id`,
+      [String(req.user.id)]
+    );
+    if (!updateRes.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await writeAuditLog(client, {
+      action: "SECURITY_APPROVAL_PIN_CLEAR",
+      entity_type: "user",
+      entity_id: updateRes.rows[0].id,
+      actor_id: req.user.id,
+      actor_role: req.user.role,
+      payload: {},
+    });
+
+    await client.query("COMMIT");
+    return res.json({ message: "Approval PIN removed" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Failed to clear approval pin:", err);
+    return res.status(500).json({ message: "Failed to clear approval pin" });
+  } finally {
+    client.release();
+  }
+});
+
+// Access permissions catalog
+router.get(
+  "/access/permissions",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("users.view"),
+  async (_req, res) => {
+    return res.json(PERMISSION_DEFINITIONS);
+  }
+);
+
+// Custom roles
+router.get(
+  "/access/roles",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("users.view"),
+  async (_req, res) => {
+    try {
+      const roles = await listAccessRoles(pool);
+      return res.json(roles);
+    } catch (err) {
+      console.error("Failed to fetch access roles:", err);
+      return res.status(500).json({ message: "Failed to fetch access roles" });
+    }
+  }
+);
+
+router.post(
+  "/access/roles",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("roles.manage"),
+  async (req, res) => {
+    const name = normalizeRoleName(req.body?.name);
+    const description = req.body?.description
+      ? String(req.body.description).trim().slice(0, 500)
+      : null;
+    const baseRole = normalizeBaseRole(req.body?.base_role, null);
+
+    if (!name || name.length < 3) {
+      return res.status(400).json({ message: "Role name must be at least 3 characters" });
+    }
+    if (!baseRole) {
+      return res.status(400).json({ message: "base_role must be ADMIN or CASHIER" });
+    }
+    if (!Array.isArray(req.body?.permissions)) {
+      return res.status(400).json({ message: "permissions must be an array" });
+    }
+
+    const permissions = normalizePermissionKeys(req.body.permissions);
+    if (permissions.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "At least one permission is required" });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const roleRes = await client.query(
+        `INSERT INTO access_roles (name, description, base_role, is_system, is_active, updated_at)
+         VALUES ($1, $2, $3, FALSE, TRUE, NOW())
+         RETURNING id`,
+        [name, description, baseRole]
+      );
+      const roleId = Number(roleRes.rows[0]?.id || 0);
+
+      for (const permission of permissions) {
+        await client.query(
+          `INSERT INTO access_role_permissions (role_id, permission_key)
+           VALUES ($1, $2)
+           ON CONFLICT (role_id, permission_key) DO NOTHING`,
+          [roleId, permission]
+        );
+      }
+
+      await writeAuditLog(client, {
+        action: "ACCESS_ROLE_CREATE",
+        entity_type: "access_role",
+        entity_id: roleId,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          name,
+          base_role: baseRole,
+          permission_count: permissions.length,
+        },
+      });
+
+      const createdRole = await fetchAccessRoleById(client, roleId);
+      await client.query("COMMIT");
+      return res.status(201).json(createdRole);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      if (String(err?.code) === "23505") {
+        return res.status(409).json({ message: "A role with this name already exists" });
+      }
+      console.error("Failed to create access role:", err);
+      return res.status(500).json({ message: "Failed to create access role" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.put(
+  "/access/roles/:id",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("roles.manage"),
+  async (req, res) => {
+    const roleId = parsePositiveInt(req.params.id, NaN, 1, 1_000_000);
+    if (!Number.isFinite(roleId)) {
+      return res.status(400).json({ message: "Invalid role id" });
+    }
+
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const hasName = Object.prototype.hasOwnProperty.call(body, "name");
+    const hasDescription = Object.prototype.hasOwnProperty.call(body, "description");
+    const hasBaseRole = Object.prototype.hasOwnProperty.call(body, "base_role");
+    const hasIsActive = Object.prototype.hasOwnProperty.call(body, "is_active");
+    const hasPermissions = Object.prototype.hasOwnProperty.call(body, "permissions");
+
+    if (hasPermissions && !Array.isArray(body.permissions)) {
+      return res.status(400).json({ message: "permissions must be an array" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const currentRes = await client.query(
+        `SELECT id, name, description, base_role, is_system, is_active
+         FROM access_roles
+         WHERE id = $1
+         FOR UPDATE`,
+        [roleId]
+      );
+      const current = currentRes.rows[0];
+      if (!current) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Role not found" });
+      }
+      if (current.is_system === true) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "System roles cannot be modified" });
+      }
+
+      const nextName = hasName ? normalizeRoleName(body.name) : current.name;
+      const nextDescription = hasDescription
+        ? String(body.description || "").trim().slice(0, 500) || null
+        : current.description;
+      const nextBaseRole = hasBaseRole
+        ? normalizeBaseRole(body.base_role, null)
+        : String(current.base_role || "").toUpperCase();
+      const nextIsActive = hasIsActive ? body.is_active !== false : current.is_active !== false;
+
+      if (!nextName || nextName.length < 3) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Role name must be at least 3 characters" });
+      }
+      if (!nextBaseRole) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "base_role must be ADMIN or CASHIER" });
+      }
+      if (!nextIsActive) {
+        const assignedRes = await client.query(
+          `SELECT COUNT(*) AS count
+           FROM users
+           WHERE custom_role_id = $1`,
+          [roleId]
+        );
+        const assignedCount = Number(assignedRes.rows[0]?.count || 0);
+        if (assignedCount > 0) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            message: "Cannot deactivate a role that is assigned to users",
+          });
+        }
+      }
+
+      await client.query(
+        `UPDATE access_roles
+         SET name = $2,
+             description = $3,
+             base_role = $4,
+             is_active = $5,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [roleId, nextName, nextDescription, nextBaseRole, nextIsActive]
+      );
+
+      if (hasPermissions) {
+        const permissions = normalizePermissionKeys(body.permissions);
+        if (permissions.length === 0) {
+          await client.query("ROLLBACK");
+          return res
+            .status(400)
+            .json({ message: "At least one permission is required" });
+        }
+        await client.query(
+          `DELETE FROM access_role_permissions
+           WHERE role_id = $1`,
+          [roleId]
+        );
+        for (const permission of permissions) {
+          await client.query(
+            `INSERT INTO access_role_permissions (role_id, permission_key)
+             VALUES ($1, $2)
+             ON CONFLICT (role_id, permission_key) DO NOTHING`,
+            [roleId, permission]
+          );
+        }
+      }
+
+      await writeAuditLog(client, {
+        action: "ACCESS_ROLE_UPDATE",
+        entity_type: "access_role",
+        entity_id: roleId,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          name: nextName,
+          base_role: nextBaseRole,
+          is_active: nextIsActive,
+          permissions_updated: hasPermissions,
+        },
+      });
+
+      const updatedRole = await fetchAccessRoleById(client, roleId);
+      await client.query("COMMIT");
+      return res.json(updatedRole);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      if (String(err?.code) === "23505") {
+        return res.status(409).json({ message: "A role with this name already exists" });
+      }
+      console.error("Failed to update access role:", err);
+      return res.status(500).json({ message: "Failed to update access role" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.delete(
+  "/access/roles/:id",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("roles.manage"),
+  async (req, res) => {
+    const roleId = parsePositiveInt(req.params.id, NaN, 1, 1_000_000);
+    if (!Number.isFinite(roleId)) {
+      return res.status(400).json({ message: "Invalid role id" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const roleRes = await client.query(
+        `SELECT id, name, is_system
+         FROM access_roles
+         WHERE id = $1
+         FOR UPDATE`,
+        [roleId]
+      );
+      const role = roleRes.rows[0];
+      if (!role) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Role not found" });
+      }
+      if (role.is_system === true) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "System roles cannot be deleted" });
+      }
+
+      const usageRes = await client.query(
+        `SELECT COUNT(*) AS count
+         FROM users
+         WHERE custom_role_id = $1`,
+        [roleId]
+      );
+      const usageCount = Number(usageRes.rows[0]?.count || 0);
+      if (usageCount > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          message: "Role is assigned to users. Reassign users before deleting role.",
+        });
+      }
+
+      await client.query(
+        `DELETE FROM access_roles
+         WHERE id = $1`,
+        [roleId]
+      );
+
+      await writeAuditLog(client, {
+        action: "ACCESS_ROLE_DELETE",
+        entity_type: "access_role",
+        entity_id: roleId,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: { name: role.name },
+      });
+
+      await client.query("COMMIT");
+      return res.json({ message: "Role deleted successfully" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Failed to delete access role:", err);
+      return res.status(500).json({ message: "Failed to delete access role" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// User management
+router.get(
+  "/users",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("users.view"),
+  async (req, res) => {
+    const includeInactive =
+      String(req.query.include_inactive || "")
+        .trim()
+        .toLowerCase() === "true";
+    try {
+      const { rows } = await pool.query(
+        `SELECT
+           u.id::text AS id,
+           u.username,
+           u.role,
+           u."isActive" AS is_active,
+           COALESCE(u.is_super_admin, FALSE) AS is_super_admin,
+           u.custom_role_id,
+           ar.name AS custom_role_name,
+           ar.is_active AS custom_role_is_active,
+           COALESCE(
+             ARRAY_AGG(DISTINCT arp.permission_key) FILTER (WHERE arp.permission_key IS NOT NULL),
+             ARRAY[]::text[]
+           ) AS custom_permissions
+         FROM users u
+         LEFT JOIN access_roles ar ON ar.id = u.custom_role_id
+         LEFT JOIN access_role_permissions arp ON arp.role_id = ar.id
+         ${includeInactive ? "" : 'WHERE u."isActive" = TRUE'}
+         GROUP BY
+           u.id,
+           u.username,
+           u.role,
+           u."isActive",
+           u.is_super_admin,
+           u.custom_role_id,
+           ar.name,
+           ar.is_active
+         ORDER BY u.id ASC`
+      );
+      return res.json(rows.map(mapUserAccessRow));
+    } catch (err) {
+      console.error("Failed to fetch users:", err);
+      return res.status(500).json({ message: "Failed to fetch users" });
+    }
+  }
+);
+
+router.post(
+  "/users",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("users.manage"),
+  async (req, res) => {
+    const username = normalizeUsername(req.body?.username);
+    const rawPassword = String(req.body?.password || "");
+    const role = normalizeBaseRole(req.body?.role, "CASHIER");
+    const isActive = req.body?.is_active !== false;
+    const customRoleInput = parseOptionalRoleId(req.body?.custom_role_id);
+
+    if (!username) {
+      return res.status(400).json({
+        message:
+          "username is required and must be 3-50 characters (letters, numbers, ., _, -)",
+      });
+    }
+    if (rawPassword.length < 6) {
+      return res.status(400).json({ message: "password must be at least 6 characters" });
+    }
+    if (Number.isNaN(customRoleInput)) {
+      return res.status(400).json({ message: "custom_role_id is invalid" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      let customRoleId = null;
+      if (Number.isFinite(customRoleInput)) {
+        const roleValidation = await resolveAssignableRole(
+          client,
+          customRoleInput,
+          role
+        );
+        if (roleValidation?.error) {
+          await client.query("ROLLBACK");
+          return res.status(roleValidation.status).json({ message: roleValidation.error });
+        }
+        customRoleId = roleValidation.id;
+      } else {
+        customRoleId = await resolveDefaultSystemRoleId(client, role);
+      }
+
+      const duplicateUserRes = await client.query(
+        `SELECT id::text AS id
+         FROM users
+         WHERE LOWER(username) = LOWER($1)
+         LIMIT 1`,
+        [username]
+      );
+      if (duplicateUserRes.rows[0]) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: "Username already exists" });
+      }
+
+      const passwordHash = await bcrypt.hash(rawPassword, 10);
+      const insertRes = await client.query(
+        `INSERT INTO users (username, "passwordHash", role, "isActive", custom_role_id)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id::text AS id`,
+        [username, passwordHash, role, isActive, customRoleId]
+      );
+      const userId = insertRes.rows[0]?.id;
+
+      const createdUserRes = await client.query(
+        `SELECT
+           u.id::text AS id,
+           u.username,
+           u.role,
+           u."isActive" AS is_active,
+           COALESCE(u.is_super_admin, FALSE) AS is_super_admin,
+           u.custom_role_id,
+           ar.name AS custom_role_name,
+           ar.is_active AS custom_role_is_active,
+           COALESCE(
+             ARRAY_AGG(DISTINCT arp.permission_key) FILTER (WHERE arp.permission_key IS NOT NULL),
+             ARRAY[]::text[]
+           ) AS custom_permissions
+         FROM users u
+         LEFT JOIN access_roles ar ON ar.id = u.custom_role_id
+         LEFT JOIN access_role_permissions arp ON arp.role_id = ar.id
+         WHERE u.id::text = $1
+         GROUP BY
+           u.id,
+           u.username,
+           u.role,
+           u."isActive",
+           u.is_super_admin,
+           u.custom_role_id,
+           ar.name,
+           ar.is_active`,
+        [String(userId)]
+      );
+
+      await writeAuditLog(client, {
+        action: "USER_CREATE",
+        entity_type: "user",
+        entity_id: userId,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          username,
+          role,
+          is_active: isActive,
+          custom_role_id: customRoleId,
+        },
+      });
+
+      await client.query("COMMIT");
+      return res.status(201).json(mapUserAccessRow(createdUserRes.rows[0]));
+    } catch (err) {
+      await client.query("ROLLBACK");
+      if (String(err?.code) === "23505") {
+        return res.status(409).json({ message: "Username already exists" });
+      }
+      console.error("Failed to create user:", err);
+      return res.status(500).json({ message: "Failed to create user" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.put(
+  "/users/:id",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("users.manage"),
+  async (req, res) => {
+    const userId = normalizeUserId(req.params.id);
+    if (!userId) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const hasUsername = Object.prototype.hasOwnProperty.call(body, "username");
+    const hasRole = Object.prototype.hasOwnProperty.call(body, "role");
+    const hasActive = Object.prototype.hasOwnProperty.call(body, "is_active");
+    const hasCustomRole = Object.prototype.hasOwnProperty.call(body, "custom_role_id");
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const actor = await fetchUserSecurityContext(client, req.user.id, false);
+      if (!actor) {
+        await client.query("ROLLBACK");
+        return res.status(401).json({ message: "Invalid user context" });
+      }
+      const current = await fetchUserSecurityContext(client, userId, true);
+      if (!current) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "User not found" });
+      }
+      const actorIsSuperAdmin = actor.is_super_admin === true;
+      const targetIsSuperAdmin = current.is_super_admin === true;
+      if (targetIsSuperAdmin && !actorIsSuperAdmin) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          message: "Only Super Admin can modify Super Admin credentials",
+        });
+      }
+
+      const nextRole = hasRole
+        ? normalizeBaseRole(body.role, null)
+        : String(current.role || "").toUpperCase();
+      if (!nextRole) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "role must be ADMIN or CASHIER" });
+      }
+
+      const nextUsername = hasUsername ? normalizeUsername(body.username) : current.username;
+      if (hasUsername && !nextUsername) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          message:
+            "username must be 3-50 characters (letters, numbers, ., _, -)",
+        });
+      }
+      if (
+        hasUsername &&
+        String(nextUsername || "").toLowerCase() !==
+          String(current.username || "").toLowerCase()
+      ) {
+        const duplicateUserRes = await client.query(
+          `SELECT id::text AS id
+           FROM users
+           WHERE LOWER(username) = LOWER($1)
+             AND id::text <> $2
+           LIMIT 1`,
+          [nextUsername, current.id]
+        );
+        if (duplicateUserRes.rows[0]) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ message: "Username already exists" });
+        }
+      }
+
+      const nextIsActive = hasActive ? body.is_active !== false : current.is_active !== false;
+      if (String(req.user.id) === String(current.id) && !nextIsActive) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "You cannot deactivate your own account" });
+      }
+      if (String(req.user.id) === String(current.id) && nextRole !== "ADMIN") {
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ message: "You cannot remove your own admin access" });
+      }
+      if (targetIsSuperAdmin && nextRole !== "ADMIN") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Super Admin role cannot be changed" });
+      }
+      if (targetIsSuperAdmin && !nextIsActive) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Super Admin cannot be deactivated" });
+      }
+
+      let nextCustomRoleId = current.custom_role_id
+        ? Number(current.custom_role_id)
+        : null;
+      if (targetIsSuperAdmin) {
+        nextCustomRoleId = await resolveSystemRoleIdByName(client, "Super Admin", "ADMIN");
+      } else if (hasCustomRole || hasRole) {
+        const parsedCustomRole = hasCustomRole
+          ? parseOptionalRoleId(body.custom_role_id)
+          : parseOptionalRoleId(current.custom_role_id);
+        if (Number.isNaN(parsedCustomRole)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ message: "custom_role_id is invalid" });
+        }
+
+        if (Number.isFinite(parsedCustomRole)) {
+          const roleValidation = await resolveAssignableRole(
+            client,
+            parsedCustomRole,
+            nextRole
+          );
+          if (roleValidation?.error) {
+            await client.query("ROLLBACK");
+            return res.status(roleValidation.status).json({ message: roleValidation.error });
+          }
+          nextCustomRoleId = roleValidation.id;
+        } else {
+          nextCustomRoleId = await resolveDefaultSystemRoleId(client, nextRole);
+        }
+      }
+
+      await client.query(
+        `UPDATE users
+         SET username = $2,
+             role = $3,
+             "isActive" = $4,
+             custom_role_id = $5
+         WHERE id::text = $1`,
+        [userId, nextUsername, nextRole, nextIsActive, nextCustomRoleId]
+      );
+
+      const updatedUserRes = await client.query(
+        `SELECT
+           u.id::text AS id,
+           u.username,
+           u.role,
+           u."isActive" AS is_active,
+           COALESCE(u.is_super_admin, FALSE) AS is_super_admin,
+           u.custom_role_id,
+           ar.name AS custom_role_name,
+           ar.is_active AS custom_role_is_active,
+           COALESCE(
+             ARRAY_AGG(DISTINCT arp.permission_key) FILTER (WHERE arp.permission_key IS NOT NULL),
+             ARRAY[]::text[]
+           ) AS custom_permissions
+         FROM users u
+         LEFT JOIN access_roles ar ON ar.id = u.custom_role_id
+         LEFT JOIN access_role_permissions arp ON arp.role_id = ar.id
+         WHERE u.id::text = $1
+         GROUP BY
+           u.id,
+           u.username,
+           u.role,
+           u."isActive",
+           u.is_super_admin,
+           u.custom_role_id,
+           ar.name,
+           ar.is_active`,
+        [userId]
+      );
+
+      await writeAuditLog(client, {
+        action: "USER_UPDATE",
+        entity_type: "user",
+        entity_id: userId,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          username: nextUsername,
+          role: nextRole,
+          is_active: nextIsActive,
+          custom_role_id: nextCustomRoleId,
+        },
+      });
+
+      await client.query("COMMIT");
+      return res.json(mapUserAccessRow(updatedUserRes.rows[0]));
+    } catch (err) {
+      await client.query("ROLLBACK");
+      if (String(err?.code) === "23505") {
+        return res.status(409).json({ message: "Username already exists" });
+      }
+      console.error("Failed to update user:", err);
+      return res.status(500).json({ message: "Failed to update user" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.post(
+  "/users/:id/reset-password",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("users.manage"),
+  async (req, res) => {
+    const userId = normalizeUserId(req.params.id);
+    const password = String(req.body?.password || req.body?.new_password || "");
+    const confirm = String(req.body?.confirm_password || "");
+
+    if (!userId) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ message: "password must be at least 6 characters" });
+    }
+    if (confirm && confirm !== password) {
+      return res.status(400).json({ message: "confirm_password does not match" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const actor = await fetchUserSecurityContext(client, req.user.id, false);
+      if (!actor) {
+        await client.query("ROLLBACK");
+        return res.status(401).json({ message: "Invalid user context" });
+      }
+      const existing = await fetchUserSecurityContext(client, userId, true);
+      if (!existing) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "User not found" });
+      }
+      if (existing.is_super_admin === true && actor.is_super_admin !== true) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          message: "Only Super Admin can reset Super Admin credentials",
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(password, 10);
+      await client.query(
+        `UPDATE users
+         SET "passwordHash" = $2
+         WHERE id::text = $1`,
+        [userId, passwordHash]
+      );
+
+      await writeAuditLog(client, {
+        action: "USER_PASSWORD_RESET",
+        entity_type: "user",
+        entity_id: userId,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: { username: existing.username },
+      });
+
+      await client.query("COMMIT");
+      return res.json({ message: "Password reset successfully" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Failed to reset user password:", err);
+      return res.status(500).json({ message: "Failed to reset password" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.delete(
+  "/users/:id",
+  auth,
+  authorize("ADMIN"),
+  authorizePermissions("users.manage"),
+  async (req, res) => {
+    const userId = normalizeUserId(req.params.id);
+    if (!userId) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const actor = await fetchUserSecurityContext(client, req.user.id, false);
+      if (!actor) {
+        await client.query("ROLLBACK");
+        return res.status(401).json({ message: "Invalid user context" });
+      }
+      const target = await fetchUserSecurityContext(client, userId, true);
+      if (!target) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "User not found" });
+      }
+      if (String(actor.id) === String(target.id)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "You cannot delete your own account" });
+      }
+      if (target.is_super_admin === true) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "Super Admin cannot be deleted" });
+      }
+
+      await client.query(`DELETE FROM branch_users WHERE user_id = $1`, [target.id]);
+      await client.query(
+        `UPDATE employees
+         SET user_id = NULL,
+             updated_at = NOW()
+         WHERE user_id = $1`,
+        [target.id]
+      );
+      await client.query(
+        `DELETE FROM users
+         WHERE id::text = $1`,
+        [target.id]
+      );
+
+      await writeAuditLog(client, {
+        action: "USER_DELETE",
+        entity_type: "user",
+        entity_id: target.id,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          username: target.username,
+          role: target.role,
+        },
+      });
+
+      await client.query("COMMIT");
+      return res.json({ message: "User deleted successfully" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Failed to delete user:", err);
+      return res.status(500).json({ message: "Failed to delete user" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Shift management
+router.get("/shifts/current", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const branchId = parseBranchId(req.query.branch_id, 1);
     const { rows } = await pool.query(
       `SELECT *
        FROM cash_shifts
        WHERE status = 'OPEN'
+         AND COALESCE(branch_id, 1) = $1
        ORDER BY opened_at DESC
-       LIMIT 1`
+       LIMIT 1`,
+      [branchId]
     );
     return res.json({ shift: rows[0] || null });
   } catch (err) {
@@ -801,19 +2299,26 @@ router.post("/shifts/open", auth, authorize("ADMIN"), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const branchId = await resolveActiveBranchId(client, req.body?.branch_id);
     const existing = await client.query(
-      `SELECT id FROM cash_shifts WHERE status = 'OPEN' LIMIT 1 FOR UPDATE`
+      `SELECT id
+       FROM cash_shifts
+       WHERE status = 'OPEN'
+         AND COALESCE(branch_id, 1) = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [branchId]
     );
     if (existing.rows[0]) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ message: "An open shift already exists" });
+      return res.status(409).json({ message: "An open shift already exists for this branch" });
     }
 
     const { rows } = await client.query(
-      `INSERT INTO cash_shifts (opened_by, opening_cash, note, status)
-       VALUES ($1, $2, $3, 'OPEN')
+      `INSERT INTO cash_shifts (opened_by, opening_cash, note, status, branch_id)
+       VALUES ($1, $2, $3, 'OPEN', $4)
        RETURNING *`,
-      [String(req.user.id), openingCash, note]
+      [String(req.user.id), openingCash, note, branchId]
     );
 
     await writeAuditLog(client, {
@@ -822,7 +2327,7 @@ router.post("/shifts/open", auth, authorize("ADMIN"), async (req, res) => {
       entity_id: rows[0].id,
       actor_id: req.user.id,
       actor_role: req.user.role,
-      payload: { opening_cash: openingCash, note },
+      payload: { opening_cash: openingCash, note, branch_id: branchId },
     });
 
     await client.query("COMMIT");
@@ -872,9 +2377,10 @@ router.post("/shifts/:id/close", auth, authorize("ADMIN"), async (req, res) => {
       `SELECT COALESCE(SUM(total - COALESCE(refunded_amount, 0)), 0) AS cash_sales
        FROM orders
        WHERE payment_method = 'CASH'
-         AND created_at >= $1
-         AND status <> 'VOIDED'`,
-      [shift.opened_at]
+          AND created_at >= $1
+          AND status <> 'VOIDED'
+          AND COALESCE(branch_id, 1) = $2`,
+      [shift.opened_at, Number(shift.branch_id || 1)]
     );
     const expectedCash =
       parseFloat(shift.opening_cash || 0) +
@@ -906,6 +2412,7 @@ router.post("/shifts/:id/close", auth, authorize("ADMIN"), async (req, res) => {
         closing_cash_expected: expectedCash,
         variance,
         note,
+        branch_id: Number(shift.branch_id || 1),
       },
     });
 
@@ -925,18 +2432,22 @@ router.get("/expenses", auth, authorize("ADMIN"), async (req, res) => {
   try {
     const days = parsePositiveInt(req.query.days, 30, 1, 3650);
     const limit = parsePositiveInt(req.query.limit, 200, 1, 1000);
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
     const { rows } = await pool.query(
-      `SELECT id, category, description, amount, incurred_at, created_by, created_at
+      `SELECT id, title, category, description, amount, incurred_at, created_by, branch_id, created_at
        FROM expenses
        WHERE incurred_at >= NOW() - (($1::text || ' days')::interval)
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}
        ORDER BY incurred_at DESC
-       LIMIT $2`,
-      [days, limit]
+       LIMIT $${hasBranchFilter ? 3 : 2}`,
+      hasBranchFilter ? [days, branchId, limit] : [days, limit]
     );
     return res.json(
       rows.map((row) => ({
         ...row,
         amount: parseFloat(row.amount || 0),
+        branch_id: row.branch_id ? Number(row.branch_id) : null,
       }))
     );
   } catch (err) {
@@ -947,14 +2458,19 @@ router.get("/expenses", auth, authorize("ADMIN"), async (req, res) => {
 
 router.post("/expenses", auth, authorize("ADMIN"), async (req, res) => {
   const category = String(req.body?.category || "").trim().slice(0, 80);
+  const title = String(req.body?.title || category || "").trim().slice(0, 120);
   const description = req.body?.description
     ? String(req.body.description).trim().slice(0, 500)
     : null;
   const amount = parseMoney(req.body?.amount, NaN);
   const incurredAt = req.body?.incurred_at || null;
+  const branchIdRaw = parsePositiveInt(req.body?.branch_id, NaN, 1, 1_000_000);
 
   if (!category) {
     return res.status(400).json({ message: "category is required" });
+  }
+  if (!title) {
+    return res.status(400).json({ message: "title is required" });
   }
   if (!Number.isFinite(amount) || amount <= 0) {
     return res.status(400).json({ message: "amount must be a positive number" });
@@ -963,11 +2479,12 @@ router.post("/expenses", auth, authorize("ADMIN"), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const branchId = await resolveActiveBranchId(client, branchIdRaw);
     const { rows } = await client.query(
-      `INSERT INTO expenses (category, description, amount, incurred_at, created_by)
-       VALUES ($1, $2, $3, COALESCE($4, NOW()), $5)
+      `INSERT INTO expenses (title, category, description, amount, incurred_at, created_by, branch_id)
+       VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), $6, $7)
        RETURNING *`,
-      [category, description, amount, incurredAt, String(req.user.id)]
+      [title, category, description, amount, incurredAt, String(req.user.id), branchId]
     );
 
     await writeAuditLog(client, {
@@ -976,13 +2493,19 @@ router.post("/expenses", auth, authorize("ADMIN"), async (req, res) => {
       entity_id: rows[0].id,
       actor_id: req.user.id,
       actor_role: req.user.role,
-      payload: { category, amount, incurred_at: rows[0].incurred_at },
+      payload: {
+        category,
+        amount,
+        incurred_at: rows[0].incurred_at,
+        branch_id: branchId,
+      },
     });
 
     await client.query("COMMIT");
     return res.status(201).json({
       ...rows[0],
       amount: parseFloat(rows[0].amount || 0),
+      branch_id: rows[0].branch_id ? Number(rows[0].branch_id) : branchId,
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -1252,12 +2775,21 @@ router.post(
 );
 
 // CSV backup download
-router.get("/backup/csv", auth, authorize("ADMIN"), async (_req, res) => {
+router.get("/backup/csv", auth, authorize("ADMIN"), async (req, res) => {
   const client = await pool.connect();
   try {
     const { csv, totalRows } = await buildBackupCsv(client);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const fileName = `camellia-backup-${timestamp}.csv`;
+
+    await writeAuditLog(client, {
+      action: "BACKUP_CSV_EXPORT",
+      entity_type: "backup",
+      entity_id: fileName,
+      actor_id: req.user.id,
+      actor_role: req.user.role,
+      payload: { rows: totalRows },
+    });
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
@@ -1298,6 +2830,17 @@ router.post(
       await client.query("BEGIN");
       const truncatedTables = await truncateBusinessTables(client);
       const restoredRows = await restoreFromParsedRows(client, parsedRows);
+      await writeAuditLog(client, {
+        action: "BACKUP_CSV_RESTORE",
+        entity_type: "backup_restore",
+        entity_id: null,
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          restored_rows: restoredRows,
+          truncated_tables: truncatedTables,
+        },
+      });
       await client.query("COMMIT");
 
       return res.json({
@@ -1317,6 +2860,43 @@ router.post(
     }
   }
 );
+
+router.get("/backup/jobs", auth, authorize("ADMIN"), async (req, res) => {
+  const limit = parsePositiveInt(req.query.limit, 100, 1, 500);
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, trigger_source, status, backup_path, details, created_at
+       FROM backup_jobs
+       ORDER BY created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error("Failed to fetch backup jobs:", err);
+    return res.status(500).json({ message: "Failed to fetch backup jobs" });
+  }
+});
+
+router.post("/backup/validate", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const result = await runBackupValidationJob({
+      triggerSource: "MANUAL_API",
+      actorId: req.user?.id ? String(req.user.id) : null,
+      actorRole: req.user?.role ? String(req.user.role) : null,
+    });
+    if (String(result?.status || "").toUpperCase() !== "SUCCESS") {
+      return res.status(500).json({
+        message: "Backup validation failed",
+        job: result,
+      });
+    }
+    return res.status(201).json(result);
+  } catch (err) {
+    console.error("Failed to run backup validation job:", err);
+    return res.status(500).json({ message: "Failed to run backup validation job" });
+  }
+});
 
 // Reset all business data (users are preserved)
 router.post("/reset", auth, authorize("ADMIN"), async (req, res) => {
@@ -1344,6 +2924,14 @@ router.post("/reset", auth, authorize("ADMIN"), async (req, res) => {
   try {
     await client.query("BEGIN");
     const truncatedTables = await truncateBusinessTables(client);
+    await writeAuditLog(client, {
+      action: "SYSTEM_RESET",
+      entity_type: "system",
+      entity_id: null,
+      actor_id: req.user.id,
+      actor_role: req.user.role,
+      payload: { truncated_tables: truncatedTables },
+    });
     await client.query("COMMIT");
     return res.json({
       message: "System reset completed successfully",

@@ -7,7 +7,13 @@ import adminRoutes from "./routes/admin.js";
 import inventoryRoutes from "./routes/inventory.js";
 import crmRoutes from "./routes/crm.js";
 import printingRoutes from "./routes/printing.js";
+import branchRoutes from "./routes/branches.js";
+import supplyRoutes from "./routes/supply.js";
+import operationsRoutes from "./routes/operations.js";
+import analyticsRoutes from "./routes/analytics.js";
 import { runAppMigrations } from "./dbMigrate.js";
+import { startDailyBackupScheduler } from "./services/backupJobs.js";
+import { startReportExportScheduler } from "./services/reportExportJobs.js";
 
 dotenv.config();
 
@@ -82,6 +88,10 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/inventory", inventoryRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/printing", printingRoutes);
+app.use("/api/branches", branchRoutes);
+app.use("/api/supply", supplyRoutes);
+app.use("/api/operations", operationsRoutes);
+app.use("/api/analytics", analyticsRoutes);
 
 const port = process.env.PORT || 4000;
 
@@ -104,6 +114,8 @@ async function startServer() {
     app.listen(port, () => {
       // eslint-disable-next-line no-console
       console.log(`Backend listening on port ${port}`);
+      startDailyBackupScheduler();
+      startReportExportScheduler();
     });
   } catch (err) {
     console.error("Failed to start backend:", err);
@@ -112,4 +124,3 @@ async function startServer() {
 }
 
 startServer();
-

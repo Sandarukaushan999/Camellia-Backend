@@ -1,4 +1,5 @@
 import express from "express";
+import bcrypt from "bcrypt";
 import auth from "../middleware/auth.js";
 import authorize from "../middleware/authorize.js";
 import pool from "../db.js";
@@ -34,6 +35,154 @@ function parseMoney(value, fallback = 0) {
     return fallback;
   }
   return Math.round(parsed * 100) / 100;
+}
+
+function formatInvoiceNumber(orderId) {
+  const parsed = Number.parseInt(orderId, 10);
+  const safeId = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  return `VOXO${String(safeId).padStart(6, "0")}`;
+}
+
+function parseBranchId(value, fallback = 1) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function normalizeApprovalPin(value) {
+  return String(value || "")
+    .replace(/[^\d]/g, "")
+    .slice(0, 12);
+}
+
+function normalizeUsername(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .slice(0, 50);
+}
+
+async function resolveActiveBranchId(client, requestedBranchId = 1) {
+  const branchId = parseBranchId(requestedBranchId, 1);
+  const branchRes = await client.query(
+    `SELECT id
+     FROM branches
+     WHERE id = $1
+       AND is_active = TRUE
+     LIMIT 1`,
+    [branchId]
+  );
+  if (branchRes.rows[0]) {
+    return Number(branchRes.rows[0].id);
+  }
+
+  const fallbackRes = await client.query(
+    `SELECT id
+     FROM branches
+     WHERE is_active = TRUE
+     ORDER BY id ASC
+     LIMIT 1`
+  );
+  return Number(fallbackRes.rows[0]?.id || 1);
+}
+
+async function resolveSensitiveActionApproval(client, req) {
+  const requestedById = req.user?.id ? String(req.user.id) : null;
+  const requestedByRole = req.user?.role ? String(req.user.role) : null;
+  const managerPin = normalizeApprovalPin(req.body?.manager_pin);
+  const managerUsername = normalizeUsername(req.body?.manager_username);
+
+  if (requestedByRole === "ADMIN" && !managerPin) {
+    return {
+      ok: true,
+      approval_mode: "ADMIN_SESSION",
+      approved_by: requestedById,
+      approved_by_username: req.user?.username || null,
+      requested_by: requestedById,
+      requested_by_role: requestedByRole,
+    };
+  }
+
+  if (!managerPin || managerPin.length < 4) {
+    return {
+      ok: false,
+      status: 400,
+      message: "manager_pin must be at least 4 digits",
+    };
+  }
+
+  const params = [];
+  let whereSql = `WHERE role = 'ADMIN' AND "isActive" = TRUE`;
+  if (managerUsername) {
+    params.push(managerUsername);
+    whereSql += ` AND LOWER(username) = $${params.length}`;
+  }
+
+  const adminUsersRes = await client.query(
+    `SELECT
+       id::text AS id,
+       username,
+       approval_pin_hash
+     FROM users
+     ${whereSql}
+     ORDER BY id ASC`,
+    params
+  );
+  const adminUsers = adminUsersRes.rows;
+
+  for (const admin of adminUsers) {
+    const hash = String(admin.approval_pin_hash || "").trim();
+    if (!hash) {
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const isMatch = await bcrypt.compare(managerPin, hash);
+    if (isMatch) {
+      return {
+        ok: true,
+        approval_mode: "MANAGER_PIN",
+        approved_by: String(admin.id),
+        approved_by_username: admin.username,
+        requested_by: requestedById,
+        requested_by_role: requestedByRole,
+      };
+    }
+  }
+
+  const envPinHash = String(process.env.MANAGER_APPROVAL_PIN_HASH || "").trim();
+  if (envPinHash) {
+    const isEnvHashMatch = await bcrypt.compare(managerPin, envPinHash);
+    if (isEnvHashMatch) {
+      return {
+        ok: true,
+        approval_mode: "ENV_MANAGER_PIN_HASH",
+        approved_by: null,
+        approved_by_username: managerUsername || null,
+        requested_by: requestedById,
+        requested_by_role: requestedByRole,
+      };
+    }
+  }
+
+  const envPin = normalizeApprovalPin(process.env.MANAGER_APPROVAL_PIN);
+  if (envPin && managerPin === envPin) {
+    return {
+      ok: true,
+      approval_mode: "ENV_MANAGER_PIN",
+      approved_by: null,
+      approved_by_username: managerUsername || null,
+      requested_by: requestedById,
+      requested_by_role: requestedByRole,
+    };
+  }
+
+  return {
+    ok: false,
+    status: 403,
+    message: "Manager PIN approval failed",
+  };
 }
 
 let productIngredientQuantityExprPromise = null;
@@ -184,6 +333,7 @@ function normalizeHeldMeta(metaInput) {
 function mapHeldOrderRow(row) {
   return {
     id: row.id,
+    branch_id: row.branch_id ? Number(row.branch_id) : null,
     order_type: row.order_type,
     table_number: row.table_number,
     customer_name: row.customer_name,
@@ -203,9 +353,12 @@ function mapHeldOrderRow(row) {
 router.get("/held", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
   try {
     const limit = parsePositiveInt(req.query.limit, 50, 1, 200);
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
     const { rows } = await pool.query(
       `SELECT
          ho.id,
+         ho.branch_id,
          ho.order_type,
          ho.table_number,
          ho.customer_name,
@@ -217,9 +370,10 @@ router.get("/held", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
          u.username AS created_by_username
        FROM held_orders ho
        LEFT JOIN users u ON u.id::text = ho.created_by
+       ${hasBranchFilter ? "WHERE COALESCE(ho.branch_id, 1) = $2" : ""}
        ORDER BY ho.created_at DESC
        LIMIT $1`,
-      [limit]
+      hasBranchFilter ? [limit, branchId] : [limit]
     );
 
     return res.json(rows.map(mapHeldOrderRow));
@@ -231,8 +385,11 @@ router.get("/held", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
 
 // Create held order (both ADMIN and CASHIER)
 router.post("/held", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
+  const client = await pool.connect();
   try {
+    await client.query("BEGIN");
     const orderType = toSafeOrderType(req.body?.order_type);
+    const branchId = await resolveActiveBranchId(client, req.body?.branch_id);
     const tableNumber = req.body?.table_number
       ? String(req.body.table_number).trim().slice(0, 50)
       : null;
@@ -245,11 +402,13 @@ router.post("/held", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
     const createdBy = req.user?.id ? String(req.user.id).trim() : null;
 
     if (items.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(400).json({ message: "At least one valid item is required to hold an order" });
     }
 
-    const { rows } = await pool.query(
+    const { rows } = await client.query(
       `INSERT INTO held_orders (
+         branch_id,
          order_type,
          table_number,
          customer_name,
@@ -258,9 +417,10 @@ router.post("/held", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
          meta,
          created_by
        )
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7)
-       RETURNING id, order_type, table_number, customer_name, customer_phone, items, meta, created_at, created_by`,
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8)
+       RETURNING id, branch_id, order_type, table_number, customer_name, customer_phone, items, meta, created_at, created_by`,
       [
+        branchId,
         orderType,
         tableNumber || null,
         customerName || null,
@@ -271,10 +431,20 @@ router.post("/held", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
       ]
     );
 
+    await writeOrderAudit(client, req.user, "ORDER_HELD", rows[0]?.id, {
+      branch_id: branchId,
+      order_type: orderType,
+      items_count: items.length,
+    });
+
+    await client.query("COMMIT");
     return res.status(201).json(mapHeldOrderRow(rows[0]));
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("Held order create failed:", err);
     return res.status(500).json({ message: "Failed to hold order" });
+  } finally {
+    client.release();
   }
 });
 
@@ -295,6 +465,7 @@ router.post(
       const { rows } = await client.query(
         `SELECT
            ho.id,
+           ho.branch_id,
            ho.order_type,
            ho.table_number,
            ho.customer_name,
@@ -303,9 +474,13 @@ router.post(
            ho.meta,
            ho.created_at,
            ho.created_by,
-           u.username AS created_by_username
+           (
+             SELECT u.username
+             FROM users u
+             WHERE u.id::text = ho.created_by
+             LIMIT 1
+           ) AS created_by_username
          FROM held_orders ho
-         LEFT JOIN users u ON u.id::text = ho.created_by
          WHERE ho.id = $1
          FOR UPDATE`,
         [heldId]
@@ -317,6 +492,9 @@ router.post(
       }
 
       await client.query("DELETE FROM held_orders WHERE id = $1", [heldId]);
+      await writeOrderAudit(client, req.user, "ORDER_HELD_RECALL", heldId, {
+        branch_id: rows[0]?.branch_id ? Number(rows[0].branch_id) : null,
+      });
       await client.query("COMMIT");
       return res.json({ held_order: mapHeldOrderRow(rows[0]) });
     } catch (err) {
@@ -341,6 +519,7 @@ router.delete("/held/:id", auth, authorize("ADMIN", "CASHIER"), async (req, res)
     if (rowCount === 0) {
       return res.status(404).json({ message: "Held order not found" });
     }
+    await writeOrderAudit(pool, req.user, "ORDER_HELD_DELETE", heldId, {});
     return res.json({ message: "Held order deleted" });
   } catch (err) {
     console.error("Held order delete failed:", err);
@@ -359,19 +538,23 @@ router.get("/:id", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
     const orderRes = await pool.query(
       `SELECT
          id,
+         invoice_number,
          total,
          payment_method,
          customer_id,
          customer_name,
-         customer_phone,
-         order_type,
-         channel,
-         loyalty_points_redeemed,
-         loyalty_discount_amount,
-         status,
-         refunded_amount,
-         void_reason,
-         refund_reason,
+        customer_phone,
+        branch_id,
+        order_type,
+        channel,
+        loyalty_points_redeemed,
+        loyalty_discount_amount,
+        manual_discount_amount,
+        total_discount_amount,
+        status,
+        refunded_amount,
+        void_reason,
+        refund_reason,
          created_at
        FROM orders
        WHERE id = $1`,
@@ -393,9 +576,14 @@ router.get("/:id", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
 
     return res.json({
       ...order,
+      invoice_number:
+        String(order.invoice_number || "").trim() || formatInvoiceNumber(order.id),
+      branch_id: order.branch_id ? Number(order.branch_id) : null,
       total: parseFloat(order.total || 0),
       refunded_amount: parseFloat(order.refunded_amount || 0),
       loyalty_discount_amount: parseFloat(order.loyalty_discount_amount || 0),
+      manual_discount_amount: parseFloat(order.manual_discount_amount || 0),
+      total_discount_amount: parseFloat(order.total_discount_amount || 0),
       items: itemsRes.rows.map((item) => ({
         id: item.id,
         product_id: item.product_id,
@@ -411,7 +599,7 @@ router.get("/:id", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
 });
 
 // Void order
-router.post("/:id/void", auth, authorize("ADMIN"), async (req, res) => {
+router.post("/:id/void", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
   const orderId = parsePositiveInt(req.params.id, NaN, 1, 1_000_000_000);
   const reason = req.body?.reason ? String(req.body.reason).trim().slice(0, 500) : null;
   const restock = req.body?.restock === true;
@@ -437,6 +625,12 @@ router.post("/:id/void", auth, authorize("ADMIN"), async (req, res) => {
     if (String(order.status || "").toUpperCase() === "VOIDED") {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Order is already voided" });
+    }
+
+    const approval = await resolveSensitiveActionApproval(client, req);
+    if (!approval.ok) {
+      await client.query("ROLLBACK");
+      return res.status(approval.status || 403).json({ message: approval.message });
     }
 
     const itemsRes = await client.query(
@@ -465,6 +659,11 @@ router.post("/:id/void", auth, authorize("ADMIN"), async (req, res) => {
       reason,
       restocked: restock,
       refunded_amount: refundFull,
+      approval_mode: approval.approval_mode,
+      approved_by: approval.approved_by,
+      approved_by_username: approval.approved_by_username,
+      requested_by: approval.requested_by,
+      requested_by_role: approval.requested_by_role,
     });
 
     await client.query("COMMIT");
@@ -485,7 +684,7 @@ router.post("/:id/void", auth, authorize("ADMIN"), async (req, res) => {
 });
 
 // Refund order (partial/full)
-router.post("/:id/refund", auth, authorize("ADMIN"), async (req, res) => {
+router.post("/:id/refund", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
   const orderId = parsePositiveInt(req.params.id, NaN, 1, 1_000_000_000);
   const amount = parseMoney(req.body?.amount, NaN);
   const reason = req.body?.reason ? String(req.body.reason).trim().slice(0, 500) : null;
@@ -516,6 +715,12 @@ router.post("/:id/refund", auth, authorize("ADMIN"), async (req, res) => {
     if (String(order.status || "").toUpperCase() === "VOIDED") {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Voided orders cannot be refunded" });
+    }
+
+    const approval = await resolveSensitiveActionApproval(client, req);
+    if (!approval.ok) {
+      await client.query("ROLLBACK");
+      return res.status(approval.status || 403).json({ message: approval.message });
     }
 
     const orderTotal = parseMoney(order.total, 0);
@@ -559,6 +764,11 @@ router.post("/:id/refund", auth, authorize("ADMIN"), async (req, res) => {
       refunded_after: refundedAfter,
       reason,
       restocked: restock,
+      approval_mode: approval.approval_mode,
+      approved_by: approval.approved_by,
+      approved_by_username: approval.approved_by_username,
+      requested_by: approval.requested_by,
+      requested_by_role: approval.requested_by_role,
     });
 
     await client.query("COMMIT");
@@ -588,10 +798,12 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
     customer_id: customerIdRaw,
     customer_name: customerNameRaw,
     customer_phone: customerPhoneRaw,
+    branch_id: branchIdRaw,
     order_type: orderTypeRaw,
     channel: channelRaw,
     loyalty_points_redeemed: loyaltyPointsRedeemedRaw = 0,
     total_before_loyalty: totalBeforeLoyaltyRaw,
+    manual_discount_amount: manualDiscountAmountRaw = 0,
   } = req.body;
 
   const parsedTotal = parseMoney(total, NaN);
@@ -608,6 +820,10 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
   if (!Number.isFinite(requestedRedeemPoints) || requestedRedeemPoints < 0) {
     return res.status(400).json({ message: "Invalid loyalty points redemption" });
   }
+  const manualDiscountAmount = parseMoney(manualDiscountAmountRaw, 0);
+  if (!Number.isFinite(manualDiscountAmount) || manualDiscountAmount < 0) {
+    return res.status(400).json({ message: "Invalid manual discount amount" });
+  }
 
   let totalBeforeLoyalty = parseMoney(totalBeforeLoyaltyRaw, parsedTotal);
   if (totalBeforeLoyalty < parsedTotal) {
@@ -621,11 +837,13 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
     let customerId = customerIdRaw ? String(customerIdRaw).trim() : null;
     let customerName = customerNameRaw ? String(customerNameRaw).trim() : null;
     let customerPhone = normalizePhone(customerPhoneRaw);
+    const branchId = await resolveActiveBranchId(client, branchIdRaw);
     const orderType = toSafeOrderType(orderTypeRaw);
     const channel = toSafeChannel(channelRaw);
 
     let loyaltyPointsRedeemed = 0;
     let loyaltyDiscountAmount = 0;
+    let totalDiscountAmount = 0;
     let pointsEarned = 0;
 
     if (customerId) {
@@ -694,6 +912,7 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
         message: "Order total does not match loyalty redemption calculation",
       });
     }
+    totalDiscountAmount = parseMoney(manualDiscountAmount + loyaltyDiscountAmount, 0);
 
     pointsEarned = customerId ? computeEarnedPoints(computedTotal) : 0;
 
@@ -705,13 +924,16 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
           customer_id,
           customer_name,
           customer_phone,
+          branch_id,
           order_type,
           channel,
           loyalty_points_redeemed,
-          loyalty_discount_amount
+          loyalty_discount_amount,
+          manual_discount_amount,
+          total_discount_amount
         )
        VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id`,
       [
         computedTotal,
@@ -719,13 +941,24 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
         customerId,
         customerName,
         customerPhone || null,
+        branchId,
         orderType,
         channel,
         loyaltyPointsRedeemed,
         loyaltyDiscountAmount,
+        manualDiscountAmount,
+        totalDiscountAmount,
       ]
     );
     const orderId = orderResult.rows[0].id;
+    const invoiceNumber = formatInvoiceNumber(orderId);
+
+    await client.query(
+      `UPDATE orders
+       SET invoice_number = $2
+       WHERE id = $1`,
+      [orderId, invoiceNumber]
+    );
 
     const insertItems = items.map((item) =>
       client.query(
@@ -775,6 +1008,7 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
     await writeOrderAudit(client, req.user, "ORDER_CREATE", orderId, {
       total: computedTotal,
       payment_method: paymentMethod,
+      branch_id: branchId,
       order_type: orderType,
       channel,
       items_count: items.length,
@@ -783,11 +1017,15 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
 
     return res.status(201).json({
       id: orderId,
+      invoice_number: invoiceNumber,
       total: computedTotal,
+      branch_id: branchId,
       status: "COMPLETED",
       loyalty_points_redeemed: loyaltyPointsRedeemed,
       loyalty_points_earned: pointsEarned,
       loyalty_discount_amount: loyaltyDiscountAmount,
+      manual_discount_amount: manualDiscountAmount,
+      total_discount_amount: totalDiscountAmount,
     });
   } catch (err) {
     await client.query("ROLLBACK");

@@ -33,6 +33,18 @@ function formatMoney(value) {
   return toNumber(value, 0).toFixed(2);
 }
 
+function resolveInvoiceNumber(receipt) {
+  const explicit = normalizeText(receipt?.invoiceNo || receipt?.invoice_number || "");
+  if (explicit) {
+    return explicit;
+  }
+  const numericPart = String(receipt?.billNo || "")
+    .replace(/[^\d]/g, "")
+    .padStart(6, "0")
+    .slice(-6);
+  return `VOXO${numericPart}`;
+}
+
 function repeat(char, count) {
   return String(char || " ").repeat(Math.max(0, count));
 }
@@ -116,7 +128,7 @@ function buildReceiptLines(receipt, charsPerLine) {
   }
 
   lines.push(createSeparator(width, "-"));
-  lines.push(alignLeftRight("Bill No", `CM-${String(receipt?.billNo || "").padStart(7, "0")}`, width));
+  lines.push(alignLeftRight("Invoice", resolveInvoiceNumber(receipt), width));
   lines.push(alignLeftRight("Date", escapeField(receipt?.date), width));
   lines.push(alignLeftRight("Time", escapeField(receipt?.time), width));
   lines.push(alignLeftRight("Order Type", escapeField(receipt?.orderType || "DINE-IN"), width));
