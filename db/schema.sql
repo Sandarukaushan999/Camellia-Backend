@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS products (
   name VARCHAR(100) NOT NULL,
   price NUMERIC(10,2) NOT NULL,
   category VARCHAR(50),
+  image_url TEXT,
   "isActive" BOOLEAN DEFAULT TRUE,
   stock INT DEFAULT 0
 );
@@ -26,6 +27,23 @@ CREATE TABLE IF NOT EXISTS orders (
   channel VARCHAR(20) DEFAULT 'POS',
   loyalty_points_redeemed INT DEFAULT 0,
   loyalty_discount_amount NUMERIC(10,2) DEFAULT 0,
+  status VARCHAR(24) NOT NULL DEFAULT 'COMPLETED',
+  refunded_amount NUMERIC(10,2) NOT NULL DEFAULT 0,
+  void_reason TEXT,
+  refund_reason TEXT,
+  parent_order_id INT REFERENCES orders(id),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS held_orders (
+  id SERIAL PRIMARY KEY,
+  order_type VARCHAR(20) NOT NULL DEFAULT 'DINE-IN',
+  table_number VARCHAR(50),
+  customer_name VARCHAR(120),
+  customer_phone VARCHAR(30),
+  items JSONB NOT NULL DEFAULT '[]'::jsonb,
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_by TEXT,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -35,6 +53,85 @@ CREATE TABLE IF NOT EXISTS order_items (
   product_id INT REFERENCES products(id),
   qty INT NOT NULL,
   price NUMERIC(10,2) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id SERIAL PRIMARY KEY,
+  action VARCHAR(80) NOT NULL,
+  entity_type VARCHAR(80) NOT NULL,
+  entity_id TEXT,
+  actor_id TEXT,
+  actor_role VARCHAR(40),
+  payload JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS cash_shifts (
+  id SERIAL PRIMARY KEY,
+  opened_by TEXT NOT NULL,
+  closed_by TEXT,
+  opening_cash NUMERIC(12,2) NOT NULL DEFAULT 0,
+  closing_cash_declared NUMERIC(12,2),
+  closing_cash_expected NUMERIC(12,2),
+  variance NUMERIC(12,2),
+  status VARCHAR(16) NOT NULL DEFAULT 'OPEN',
+  note TEXT,
+  opened_at TIMESTAMP DEFAULT NOW(),
+  closed_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS expenses (
+  id SERIAL PRIMARY KEY,
+  category VARCHAR(80) NOT NULL,
+  description TEXT,
+  amount NUMERIC(12,2) NOT NULL,
+  incurred_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  created_by TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS suppliers (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  phone VARCHAR(40),
+  email VARCHAR(120),
+  address TEXT,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS purchase_orders (
+  id SERIAL PRIMARY KEY,
+  supplier_id TEXT,
+  status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
+  note TEXT,
+  ordered_at TIMESTAMP DEFAULT NOW(),
+  expected_at TIMESTAMP,
+  created_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS purchase_order_items (
+  id SERIAL PRIMARY KEY,
+  purchase_order_id INT NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  inventory_item_id INT REFERENCES inventory_items(id) ON DELETE SET NULL,
+  qty NUMERIC(12,2) NOT NULL,
+  unit_cost NUMERIC(12,2) NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS goods_receipts (
+  id SERIAL PRIMARY KEY,
+  purchase_order_id INT REFERENCES purchase_orders(id) ON DELETE SET NULL,
+  received_at TIMESTAMP DEFAULT NOW(),
+  received_by TEXT,
+  note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS goods_receipt_items (
+  id SERIAL PRIMARY KEY,
+  goods_receipt_id INT NOT NULL REFERENCES goods_receipts(id) ON DELETE CASCADE,
+  inventory_item_id INT REFERENCES inventory_items(id) ON DELETE SET NULL,
+  qty_received NUMERIC(12,2) NOT NULL,
+  unit_cost NUMERIC(12,2) NOT NULL DEFAULT 0
 );
 
 -- Inventory Items Table
@@ -148,12 +245,25 @@ ALTER TABLE orders
   ADD COLUMN IF NOT EXISTS order_type VARCHAR(20),
   ADD COLUMN IF NOT EXISTS channel VARCHAR(20),
   ADD COLUMN IF NOT EXISTS loyalty_points_redeemed INT DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS loyalty_discount_amount NUMERIC(10,2) DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS loyalty_discount_amount NUMERIC(10,2) DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS status VARCHAR(24) DEFAULT 'COMPLETED',
+  ADD COLUMN IF NOT EXISTS refunded_amount NUMERIC(10,2) DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS void_reason TEXT,
+  ADD COLUMN IF NOT EXISTS refund_reason TEXT,
+  ADD COLUMN IF NOT EXISTS parent_order_id INT;
+
+ALTER TABLE inventory_items
+  ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(12,2) DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone);
 CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(LOWER(full_name));
 CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_customer_phone ON orders(customer_phone);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_loyalty_customer_id ON customer_loyalty_txns(customer_id);
-
-
+CREATE INDEX IF NOT EXISTS idx_held_orders_created_at ON held_orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_held_orders_created_by ON held_orders(created_by);
+CREATE INDEX IF NOT EXISTS idx_expenses_incurred_at ON expenses(incurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cash_shifts_status ON cash_shifts(status);
+CREATE INDEX IF NOT EXISTS idx_purchase_orders_status ON purchase_orders(status);

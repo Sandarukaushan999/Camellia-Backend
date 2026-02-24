@@ -13,8 +13,64 @@ dotenv.config();
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+const defaultAllowedOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:4173",
+  "http://127.0.0.1:4173",
+];
+
+function parseCsv(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function isWeakJwtSecret(secret) {
+  const normalized = String(secret || "").trim();
+  if (!normalized) {
+    return true;
+  }
+  if (normalized.length < 32) {
+    return true;
+  }
+  return /change_me|changeme|default|secret|admin123|password/i.test(normalized);
+}
+
+const configuredOrigins = parseCsv(process.env.CORS_ORIGIN);
+const allowedOrigins =
+  configuredOrigins.length > 0 ? configuredOrigins : defaultAllowedOrigins;
+
+app.disable("x-powered-by");
+app.use((_, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "same-origin");
+  next();
+});
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow server-to-server and local non-browser requests.
+      if (!origin) {
+        return callback(null, true);
+      }
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
+  })
+);
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
+app.use((err, _req, res, next) => {
+  if (err?.message === "Not allowed by CORS") {
+    return res.status(403).json({ message: "CORS origin denied" });
+  }
+  return next(err);
+});
 
 app.get("/api/health", (_req, res) =>
   res.json({ status: "ok", version: "1.0.0" })
@@ -31,6 +87,19 @@ const port = process.env.PORT || 4000;
 
 async function startServer() {
   try {
+    const jwtSecret = String(process.env.JWT_SECRET || "").trim();
+    if (!jwtSecret) {
+      throw new Error("JWT_SECRET is required");
+    }
+    if (isWeakJwtSecret(jwtSecret)) {
+      const warningMessage =
+        "JWT_SECRET appears weak. Use a long random value (32+ chars).";
+      if (String(process.env.NODE_ENV || "").toLowerCase() === "production") {
+        throw new Error(warningMessage);
+      }
+      console.warn(warningMessage);
+    }
+
     await runAppMigrations();
     app.listen(port, () => {
       // eslint-disable-next-line no-console
@@ -43,6 +112,4 @@ async function startServer() {
 }
 
 startServer();
-
-
 

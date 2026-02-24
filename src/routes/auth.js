@@ -2,10 +2,23 @@ import express from "express";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import pool from "../db.js";
+import createRateLimiter from "../middleware/rateLimit.js";
 
 const router = express.Router();
 
-router.post("/login", async (req, res) => {
+const loginLimiter = createRateLimiter({
+  windowMs: Number(process.env.AUTH_LOGIN_WINDOW_MS || 15 * 60 * 1000),
+  max: Number(process.env.AUTH_LOGIN_MAX_ATTEMPTS || 8),
+  keyGenerator: (req) => {
+    const username = String(req.body?.username || "")
+      .trim()
+      .toLowerCase();
+    return `${req.ip || "unknown"}:${username || "-"}`;
+  },
+  message: "Too many login attempts. Please wait before trying again.",
+});
+
+router.post("/login", loginLimiter, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ message: "Username and password required" });
@@ -40,4 +53,3 @@ router.post("/login", async (req, res) => {
 });
 
 export default router;
-
