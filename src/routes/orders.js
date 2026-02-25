@@ -268,22 +268,50 @@ async function adjustInventoryInTransaction(client, items, direction = "DEDUCT")
   }
 }
 
-async function resolveProductUuidForOrderItem(client, item, branchId) {
+async function resolveProductIdForOrderItem(client, item, branchId) {
   const rawProductId = normalizeProductId(item?.product_id ?? item?.id);
-  if (isUuid(rawProductId)) {
-    return rawProductId;
+  if (rawProductId) {
+    const byId = await client.query(
+      `SELECT p.id::text AS id
+       FROM products p
+       LEFT JOIN branch_products bp
+         ON bp.branch_id = $2
+        AND bp.product_id = p.id::text
+       WHERE p.id::text = $1
+         AND (
+           CASE
+             WHEN bp.id IS NULL THEN COALESCE(p."isActive", TRUE)
+             ELSE COALESCE(bp.is_active, TRUE)
+           END
+         ) = TRUE
+       LIMIT 1`,
+      [rawProductId, branchId]
+    );
+    const idMatch = normalizeProductId(byId.rows[0]?.id);
+    if (idMatch) {
+      return idMatch;
+    }
   }
 
   if (rawProductId) {
     const byCode = await client.query(
       `SELECT p.id::text AS id
        FROM products p
+       LEFT JOIN branch_products bp
+         ON bp.branch_id = $2
+        AND bp.product_id = p.id::text
        WHERE p.code = $1
+         AND (
+           CASE
+             WHEN bp.id IS NULL THEN COALESCE(p."isActive", TRUE)
+             ELSE COALESCE(bp.is_active, TRUE)
+           END
+         ) = TRUE
        LIMIT 1`,
-      [rawProductId]
+      [rawProductId, branchId]
     );
     const codeMatch = normalizeProductId(byCode.rows[0]?.id);
-    if (isUuid(codeMatch)) {
+    if (codeMatch) {
       return codeMatch;
     }
   }
@@ -311,7 +339,7 @@ async function resolveProductUuidForOrderItem(client, item, branchId) {
     [rawName, branchId]
   );
   const nameMatch = normalizeProductId(byName.rows[0]?.id);
-  return isUuid(nameMatch) ? nameMatch : null;
+  return nameMatch || null;
 }
 
 async function writeOrderAudit(clientOrPool, user, action, entityId, payload = {}) {
@@ -1003,7 +1031,7 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
       // Inventory deduction is skipped automatically for unresolved products.
       // The frontend now sends name to improve this resolution path.
       // eslint-disable-next-line no-await-in-loop
-      const resolvedProductId = await resolveProductUuidForOrderItem(client, item, branchId);
+      const resolvedProductId = await resolveProductIdForOrderItem(client, item, branchId);
       if (!resolvedProductId) {
         unresolvedOrderItems.push({
           provided_product_id: normalizeProductId(item?.product_id ?? item?.id),
@@ -1063,7 +1091,7 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
 
     const insertNormalizedItems = normalizedOrderItems.map((item) =>
       client.query(
-        "INSERT INTO order_items (order_id, product_id, qty, price) VALUES ($1, $2::uuid, $3, $4)",
+        "INSERT INTO order_items (order_id, product_id, qty, price) VALUES ($1, $2, $3, $4)",
         [orderId, item.product_id, item.qty, item.price]
       )
     );
