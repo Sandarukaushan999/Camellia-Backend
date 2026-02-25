@@ -25,6 +25,7 @@ const defaultAllowedOrigins = [
   "http://127.0.0.1:5173",
   "http://localhost:4173",
   "http://127.0.0.1:4173",
+  "https://camellia-frontend.vercel.app",
 ];
 
 function parseCsv(value) {
@@ -32,6 +33,22 @@ function parseCsv(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeOrigin(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return raw;
+  }
+}
+
+function isTrueFlag(value) {
+  return String(value || "").trim().toLowerCase() === "true";
 }
 
 function isWeakJwtSecret(secret) {
@@ -45,9 +62,43 @@ function isWeakJwtSecret(secret) {
   return /change_me|changeme|default|secret|admin123|password/i.test(normalized);
 }
 
-const configuredOrigins = parseCsv(process.env.CORS_ORIGIN);
-const allowedOrigins =
-  configuredOrigins.length > 0 ? configuredOrigins : defaultAllowedOrigins;
+const configuredOrigins = parseCsv(
+  process.env.CORS_ORIGIN || process.env.CORS_ORIGINS
+).map(normalizeOrigin);
+const allowedOrigins = (
+  configuredOrigins.length > 0 ? configuredOrigins : defaultAllowedOrigins
+)
+  .map(normalizeOrigin)
+  .filter(Boolean);
+const allowAllOrigins = isTrueFlag(process.env.CORS_ALLOW_ALL);
+const allowVercelPreviews = isTrueFlag(process.env.CORS_ALLOW_VERCEL_PREVIEWS);
+
+function isOriginAllowed(origin) {
+  if (!origin) {
+    return true;
+  }
+  if (allowAllOrigins) {
+    return true;
+  }
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (!normalizedOrigin) {
+    return false;
+  }
+  if (allowedOrigins.includes(normalizedOrigin)) {
+    return true;
+  }
+  if (allowVercelPreviews) {
+    try {
+      const parsed = new URL(normalizedOrigin);
+      return (
+        parsed.protocol === "https:" && parsed.hostname.endsWith(".vercel.app")
+      );
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
 
 app.disable("x-powered-by");
 app.use((_, res, next) => {
@@ -60,15 +111,15 @@ app.use((_, res, next) => {
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow server-to-server and local non-browser requests.
-      if (!origin) {
-        return callback(null, true);
-      }
-      if (allowedOrigins.includes(origin)) {
+      if (isOriginAllowed(origin)) {
         return callback(null, true);
       }
       return callback(new Error("Not allowed by CORS"));
     },
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+    optionsSuccessStatus: 204,
   })
 );
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
