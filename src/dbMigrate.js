@@ -538,8 +538,15 @@ export async function runAppMigrations() {
 
     await client.query(`
       INSERT INTO branches (code, name, address, timezone, is_active)
-      SELECT 'HQ', 'Main Branch', NULL, 'UTC', TRUE
+      SELECT 'HQ', 'Main Branch', NULL, 'Asia/Colombo', TRUE
       WHERE NOT EXISTS (SELECT 1 FROM branches)
+    `);
+    await client.query(`
+      UPDATE branches
+      SET timezone = 'Asia/Colombo'
+      WHERE timezone IS NULL
+         OR TRIM(timezone) = ''
+         OR UPPER(TRIM(timezone)) = 'UTC'
     `);
 
     await ensureTextColumn(client, "customer_notes", "created_by");

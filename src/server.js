@@ -11,6 +11,7 @@ import branchRoutes from "./routes/branches.js";
 import supplyRoutes from "./routes/supply.js";
 import operationsRoutes from "./routes/operations.js";
 import analyticsRoutes from "./routes/analytics.js";
+import publicRoutes from "./routes/public.js";
 import { runAppMigrations } from "./dbMigrate.js";
 import { startDailyBackupScheduler } from "./services/backupJobs.js";
 import { startReportExportScheduler } from "./services/reportExportJobs.js";
@@ -92,6 +93,7 @@ app.use("/api/branches", branchRoutes);
 app.use("/api/supply", supplyRoutes);
 app.use("/api/operations", operationsRoutes);
 app.use("/api/analytics", analyticsRoutes);
+app.use("/api/public", publicRoutes);
 
 const port = process.env.PORT || 4000;
 

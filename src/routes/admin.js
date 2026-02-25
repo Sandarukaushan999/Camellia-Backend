@@ -13,6 +13,7 @@ import {
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
+const BUSINESS_TIMEZONE = String(process.env.APP_TIMEZONE || "Asia/Colombo").trim() || "Asia/Colombo";
 
 const BACKUP_TABLES = [
   "products",
@@ -457,7 +458,8 @@ function buildReportFilter(reqQuery = {}) {
   );
   const params = [days];
   const conditions = [
-    "created_at >= CURRENT_DATE - (($1::text || ' days')::interval)",
+    "created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')",
+    "created_at < NOW()",
   ];
 
   if (orderType) {
@@ -870,66 +872,92 @@ router.delete("/products/:id", auth, authorize("ADMIN"), async (req, res) => {
 // Dashboard stats
 router.get("/dashboard/stats", auth, authorize("ADMIN"), async (req, res) => {
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
+    const days = parsePositiveInt(req.query.days, 1, 1, 3650);
     const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
     const hasBranchFilter = Number.isFinite(branchId);
 
-    // Today's sales
-    const todaySales = await pool.query(
-      `SELECT COALESCE(SUM(total), 0) as total, COUNT(*) as count
+    // Current period sales
+    const currentSales = await pool.query(
+      `SELECT COALESCE(SUM(total), 0) AS total, COUNT(*) AS count
        FROM orders
-       WHERE created_at >= $1
+       WHERE created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND created_at < NOW()
+         AND COALESCE(status, 'COMPLETED') <> 'VOIDED'
          ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}`,
-      hasBranchFilter ? [today, branchId] : [today]
+      hasBranchFilter ? [days, branchId] : [days]
     );
 
-    // Yesterday's sales for comparison
-    const yesterdaySales = await pool.query(
-      `SELECT COALESCE(SUM(total), 0) as total
+    // Previous period sales for comparison
+    const previousSales = await pool.query(
+      `SELECT COALESCE(SUM(total), 0) AS total
        FROM orders
-       WHERE created_at >= $1
-         AND created_at < $2
-         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $3" : ""}`,
-      hasBranchFilter ? [yesterday, today, branchId] : [yesterday, today]
+       WHERE created_at >= DATE_TRUNC('day', NOW()) - (($1::int * 2 - 1) * INTERVAL '1 day')
+         AND created_at < DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND COALESCE(status, 'COMPLETED') <> 'VOIDED'
+         ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}`,
+      hasBranchFilter ? [days, branchId] : [days]
     );
 
-    const todayTotal = parseFloat(todaySales.rows[0].total || 0);
-    const yesterdayTotal = parseFloat(yesterdaySales.rows[0].total || 0);
-    const orderCount = parseInt(todaySales.rows[0].count || 0);
-    const avgOrderValue = orderCount > 0 ? todayTotal / orderCount : 0;
-    const salesChange = yesterdayTotal > 0 ? ((todayTotal - yesterdayTotal) / yesterdayTotal * 100).toFixed(1) : 0;
+    const periodSalesTotal = parseFloat(currentSales.rows[0].total || 0);
+    const previousSalesTotal = parseFloat(previousSales.rows[0].total || 0);
+    const orderCount = parseInt(currentSales.rows[0].count || 0, 10);
+    const avgOrderValue = orderCount > 0 ? periodSalesTotal / orderCount : 0;
+    const salesChange =
+      previousSalesTotal > 0
+        ? ((periodSalesTotal - previousSalesTotal) / previousSalesTotal) * 100
+        : periodSalesTotal > 0
+        ? 100
+        : 0;
 
     // Active orders (last 30 minutes)
     const activeOrders = await pool.query(
-      `SELECT COUNT(*) as count
+      `SELECT COUNT(*) AS count
        FROM orders
        WHERE created_at >= NOW() - INTERVAL '30 minutes'
          ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $1" : ""}`,
       hasBranchFilter ? [branchId] : []
     );
 
-    // Approximate net profit based on today's recorded expenses.
+    // Approximate net profit based on expenses in the selected period.
     const expenseRes = await pool.query(
       `SELECT COALESCE(SUM(amount), 0) AS total
        FROM expenses
-       WHERE incurred_at >= $1
+       WHERE incurred_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND incurred_at < NOW()
          ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}`,
-      hasBranchFilter ? [today, branchId] : [today]
+      hasBranchFilter ? [days, branchId] : [days]
     );
-    const expensesToday = parseFloat(expenseRes.rows[0]?.total || 0);
-    const netProfit = todayTotal - expensesToday;
+    const periodExpenses = parseFloat(expenseRes.rows[0]?.total || 0);
+    const netProfit = periodSalesTotal - periodExpenses;
+
+    const periodBoundaryRes = await pool.query(
+      `SELECT
+         DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day') AS period_start,
+         NOW() AS period_end,
+         DATE_TRUNC('day', NOW()) - (($1::int * 2 - 1) * INTERVAL '1 day') AS comparison_start,
+         DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day') AS comparison_end`,
+      [days]
+    );
+    const periodBoundaries = periodBoundaryRes.rows[0] || {};
 
     return res.json({
-      todaySales: todayTotal.toFixed(2),
-      salesChange: parseFloat(salesChange),
+      todaySales: periodSalesTotal.toFixed(2),
+      salesTotal: periodSalesTotal.toFixed(2),
+      salesChange: Number.isFinite(salesChange)
+        ? Math.round(salesChange * 10) / 10
+        : 0,
       totalOrders: orderCount,
       avgOrderValue: avgOrderValue.toFixed(2),
       netProfit: netProfit.toFixed(2),
-      expensesToday: expensesToday.toFixed(2),
+      expensesToday: periodExpenses.toFixed(2),
+      expensesTotal: periodExpenses.toFixed(2),
       activeOrders: parseInt(activeOrders.rows[0].count || 0),
+      periodDays: days,
+      periodStart: periodBoundaries.period_start || null,
+      periodEnd: periodBoundaries.period_end || null,
+      comparisonStart: periodBoundaries.comparison_start || null,
+      comparisonEnd: periodBoundaries.comparison_end || null,
+      timezone: BUSINESS_TIMEZONE,
       branchId: hasBranchFilter ? branchId : null,
     });
   } catch (err) {
@@ -940,19 +968,18 @@ router.get("/dashboard/stats", auth, authorize("ADMIN"), async (req, res) => {
 // Dashboard sales chart
 router.get("/dashboard/sales-chart", auth, authorize("ADMIN"), async (req, res) => {
   try {
-    const requestedDays = parseInt(req.query.days, 10);
-    const days = Number.isFinite(requestedDays)
-      ? Math.min(Math.max(requestedDays, 7), 365)
-      : 7;
+    const days = parsePositiveInt(req.query.days, 30, 1, 365);
     const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
     const hasBranchFilter = Number.isFinite(branchId);
 
     const { rows } = await pool.query(
-      `SELECT DATE(created_at) as day, COALESCE(SUM(total), 0) as total 
-       FROM orders 
-       WHERE created_at >= CURRENT_DATE - (($1 || ' days')::interval)
+      `SELECT DATE(created_at) AS day, COALESCE(SUM(total), 0) AS total
+       FROM orders
+       WHERE created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND created_at < NOW()
+         AND COALESCE(status, 'COMPLETED') <> 'VOIDED'
          ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}
-       GROUP BY DATE(created_at) 
+       GROUP BY DATE(created_at)
        ORDER BY day ASC`,
       hasBranchFilter ? [days, branchId] : [days]
     );
@@ -965,18 +992,19 @@ router.get("/dashboard/sales-chart", auth, authorize("ADMIN"), async (req, res) 
 // Order breakdown by type
 router.get("/dashboard/order-breakdown", auth, authorize("ADMIN"), async (req, res) => {
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const days = parsePositiveInt(req.query.days, 1, 1, 3650);
     const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
     const hasBranchFilter = Number.isFinite(branchId);
-    
+
     const { rows } = await pool.query(
-      `SELECT payment_method, COUNT(*) as count, SUM(total) as total 
-       FROM orders 
-       WHERE created_at >= $1 
+      `SELECT payment_method, COUNT(*) AS count, SUM(total) AS total
+       FROM orders
+       WHERE created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND created_at < NOW()
+         AND COALESCE(status, 'COMPLETED') <> 'VOIDED'
          ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}
        GROUP BY payment_method`,
-      hasBranchFilter ? [today, branchId] : [today]
+      hasBranchFilter ? [days, branchId] : [days]
     );
 
     const total = rows.reduce((sum, r) => sum + parseInt(r.count), 0);
@@ -996,22 +1024,26 @@ router.get("/dashboard/order-breakdown", auth, authorize("ADMIN"), async (req, r
 // Top selling items
 router.get("/dashboard/top-items", auth, authorize("ADMIN"), async (req, res) => {
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const days = parsePositiveInt(req.query.days, 1, 1, 3650);
     const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
     const hasBranchFilter = Number.isFinite(branchId);
 
     const { rows } = await pool.query(
-      `SELECT p.name, SUM(oi.qty) as total_qty, SUM(oi.qty * oi.price) as revenue
+      `SELECT
+         COALESCE(p.name, CONCAT('Item ', oi.product_id::text)) AS name,
+         SUM(oi.qty) AS total_qty,
+         SUM(oi.qty * oi.price) AS revenue
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
-       JOIN products p ON p.id = oi.product_id
-       WHERE o.created_at >= $1
+       LEFT JOIN products p ON p.id = oi.product_id
+       WHERE o.created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND o.created_at < NOW()
+         AND COALESCE(o.status, 'COMPLETED') <> 'VOIDED'
          ${hasBranchFilter ? "AND COALESCE(o.branch_id, 1) = $2" : ""}
-       GROUP BY p.name
+       GROUP BY COALESCE(p.name, CONCAT('Item ', oi.product_id::text))
        ORDER BY total_qty DESC
        LIMIT 5`,
-      hasBranchFilter ? [today, branchId] : [today]
+      hasBranchFilter ? [days, branchId] : [days]
     );
 
     return res.json(rows.map(r => ({
@@ -1024,18 +1056,73 @@ router.get("/dashboard/top-items", auth, authorize("ADMIN"), async (req, res) =>
   }
 });
 
+// Item-wise sales chart for selected period
+router.get("/dashboard/item-sales-monthly", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 30, 1, 3650);
+    const limit = parsePositiveInt(req.query.limit, 12, 1, 50);
+    const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
+    const hasBranchFilter = Number.isFinite(branchId);
+    const params = [days];
+
+    if (hasBranchFilter) {
+      params.push(branchId);
+    }
+    params.push(limit);
+    const limitParam = params.length;
+
+    const { rows } = await pool.query(
+      `SELECT
+         COALESCE(p.name, CONCAT('Item ', oi.product_id::text)) AS name,
+         COALESCE(SUM(oi.qty), 0) AS qty,
+         COALESCE(SUM(oi.qty * oi.price), 0) AS revenue
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       LEFT JOIN products p ON p.id = oi.product_id
+       WHERE o.created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND o.created_at < NOW()
+         AND COALESCE(o.status, 'COMPLETED') <> 'VOIDED'
+         ${hasBranchFilter ? "AND COALESCE(o.branch_id, 1) = $2" : ""}
+       GROUP BY COALESCE(p.name, CONCAT('Item ', oi.product_id::text))
+       ORDER BY qty DESC, revenue DESC
+       LIMIT $${limitParam}`,
+      params
+    );
+
+    return res.json(
+      rows.map((row) => ({
+        name: row.name,
+        qty: parseFloat(row.qty || 0),
+        revenue: parseFloat(row.revenue || 0),
+      }))
+    );
+  } catch (err) {
+    console.error("Failed to fetch monthly item sales:", err);
+    return res.status(500).json({ message: "Failed to fetch monthly item sales" });
+  }
+});
+
 // Recent orders
 router.get("/dashboard/recent-orders", auth, authorize("ADMIN"), async (req, res) => {
   try {
+    const days = parsePositiveInt(req.query.days, 1, 1, 3650);
     const branchId = parsePositiveInt(req.query.branch_id, NaN, 1, 1_000_000);
     const hasBranchFilter = Number.isFinite(branchId);
+    const params = [days];
+
+    if (hasBranchFilter) {
+      params.push(branchId);
+    }
+
     const { rows } = await pool.query(
       `SELECT id, total, payment_method, created_at 
        FROM orders 
-       ${hasBranchFilter ? "WHERE COALESCE(branch_id, 1) = $1" : ""}
+       WHERE created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND created_at < NOW()
+       ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}
        ORDER BY created_at DESC 
        LIMIT 10`,
-      hasBranchFilter ? [branchId] : []
+      params
     );
 
     return res.json(rows.map(r => ({
@@ -1063,9 +1150,11 @@ router.get("/dashboard/branch-comparison", auth, authorize("ADMIN"), async (req,
          COALESCE(SUM(o.total), 0) AS sales_total,
          COALESCE(AVG(o.total), 0) AS avg_order_value
        FROM branches b
-       LEFT JOIN orders o
-         ON COALESCE(o.branch_id, 1) = b.id
-        AND o.created_at >= NOW() - (($1::text || ' days')::interval)
+      LEFT JOIN orders o
+        ON COALESCE(o.branch_id, 1) = b.id
+        AND o.created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+        AND o.created_at < NOW()
+        AND COALESCE(o.status, 'COMPLETED') <> 'VOIDED'
        GROUP BY b.id, b.code, b.name
        ORDER BY sales_total DESC
        LIMIT $2`,
@@ -1108,7 +1197,8 @@ router.get("/sales", auth, authorize("ADMIN"), async (req, res) => {
 
     const params = [days];
     const where = [
-      "o.created_at >= NOW() - (($1::text || ' days')::interval)",
+      "o.created_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')",
+      "o.created_at < NOW()",
     ];
 
     if (Number.isFinite(branchId)) {
@@ -2437,7 +2527,8 @@ router.get("/expenses", auth, authorize("ADMIN"), async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, title, category, description, amount, incurred_at, created_by, branch_id, created_at
        FROM expenses
-       WHERE incurred_at >= NOW() - (($1::text || ' days')::interval)
+       WHERE incurred_at >= DATE_TRUNC('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+         AND incurred_at < NOW()
          ${hasBranchFilter ? "AND COALESCE(branch_id, 1) = $2" : ""}
        ORDER BY incurred_at DESC
        LIMIT $${hasBranchFilter ? 3 : 2}`,
