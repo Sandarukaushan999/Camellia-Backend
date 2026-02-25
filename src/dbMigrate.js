@@ -182,6 +182,30 @@ export async function runAppMigrations() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS qr_customer_requests (
+        id SERIAL PRIMARY KEY,
+        branch_id INT DEFAULT 1,
+        held_order_id INT,
+        source VARCHAR(40) NOT NULL DEFAULT 'QR_MENU',
+        customer_name VARCHAR(120) NOT NULL,
+        customer_phone VARCHAR(30) NOT NULL,
+        customer_email VARCHAR(120),
+        customer_address TEXT,
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        request_count INT NOT NULL DEFAULT 1,
+        meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+        requested_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        last_order_at TIMESTAMP,
+        reviewed_at TIMESTAMP,
+        reviewed_by TEXT,
+        review_note TEXT,
+        approved_customer_id TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS audit_logs (
         id SERIAL PRIMARY KEY,
         action VARCHAR(80) NOT NULL,
@@ -578,6 +602,23 @@ export async function runAppMigrations() {
     await addColumnIfMissing(client, "orders", "branch_id", "INT DEFAULT 1");
     await addColumnIfMissing(client, "cash_shifts", "branch_id", "INT DEFAULT 1");
     await addColumnIfMissing(client, "held_orders", "branch_id", "INT DEFAULT 1");
+    await addColumnIfMissing(client, "qr_customer_requests", "branch_id", "INT DEFAULT 1");
+    await addColumnIfMissing(client, "qr_customer_requests", "held_order_id", "INT");
+    await addColumnIfMissing(client, "qr_customer_requests", "source", "VARCHAR(40) DEFAULT 'QR_MENU'");
+    await addColumnIfMissing(client, "qr_customer_requests", "customer_name", "VARCHAR(120)");
+    await addColumnIfMissing(client, "qr_customer_requests", "customer_phone", "VARCHAR(30)");
+    await addColumnIfMissing(client, "qr_customer_requests", "customer_email", "VARCHAR(120)");
+    await addColumnIfMissing(client, "qr_customer_requests", "customer_address", "TEXT");
+    await addColumnIfMissing(client, "qr_customer_requests", "status", "VARCHAR(20) DEFAULT 'PENDING'");
+    await addColumnIfMissing(client, "qr_customer_requests", "request_count", "INT DEFAULT 1");
+    await addColumnIfMissing(client, "qr_customer_requests", "meta", "JSONB DEFAULT '{}'::jsonb");
+    await addColumnIfMissing(client, "qr_customer_requests", "requested_at", "TIMESTAMP DEFAULT NOW()");
+    await addColumnIfMissing(client, "qr_customer_requests", "last_order_at", "TIMESTAMP");
+    await addColumnIfMissing(client, "qr_customer_requests", "reviewed_at", "TIMESTAMP");
+    await addColumnIfMissing(client, "qr_customer_requests", "reviewed_by", "TEXT");
+    await addColumnIfMissing(client, "qr_customer_requests", "review_note", "TEXT");
+    await addColumnIfMissing(client, "qr_customer_requests", "approved_customer_id", "TEXT");
+    await addColumnIfMissing(client, "qr_customer_requests", "updated_at", "TIMESTAMP DEFAULT NOW()");
     await addColumnIfMissing(client, "users", "approval_pin_hash", "TEXT");
     await addColumnIfMissing(client, "users", "approval_pin_updated_at", "TIMESTAMP");
     await addColumnIfMissing(client, "users", "custom_role_id", "INT");
@@ -901,6 +942,25 @@ export async function runAppMigrations() {
       WHERE branch_id IS NULL
     `);
     await client.query(`
+      UPDATE qr_customer_requests
+      SET branch_id = 1
+      WHERE branch_id IS NULL
+    `);
+    await client.query(`
+      UPDATE qr_customer_requests
+      SET status = COALESCE(NULLIF(TRIM(status), ''), 'PENDING'),
+          source = COALESCE(NULLIF(TRIM(source), ''), 'QR_MENU'),
+          request_count = COALESCE(request_count, 1),
+          customer_name = COALESCE(NULLIF(TRIM(customer_name), ''), 'QR Customer'),
+          updated_at = COALESCE(updated_at, NOW())
+      WHERE status IS NULL
+         OR source IS NULL
+         OR request_count IS NULL
+         OR customer_name IS NULL
+         OR TRIM(customer_name) = ''
+         OR updated_at IS NULL
+    `);
+    await client.query(`
       WITH role_ids AS (
         SELECT
           MAX(CASE WHEN name = 'Super Admin' THEN id END) AS super_admin_role_id,
@@ -1015,6 +1075,54 @@ export async function runAppMigrations() {
           ALTER TABLE orders
           ADD CONSTRAINT orders_customer_id_fk
           FOREIGN KEY (customer_id)
+          REFERENCES customers(id)
+          ON DELETE SET NULL;
+        END IF;
+      END$$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'qr_customer_requests_branch_id_fk'
+        ) THEN
+          ALTER TABLE qr_customer_requests
+          ADD CONSTRAINT qr_customer_requests_branch_id_fk
+          FOREIGN KEY (branch_id)
+          REFERENCES branches(id)
+          ON DELETE SET NULL;
+        END IF;
+      END$$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'qr_customer_requests_held_order_id_fk'
+        ) THEN
+          ALTER TABLE qr_customer_requests
+          ADD CONSTRAINT qr_customer_requests_held_order_id_fk
+          FOREIGN KEY (held_order_id)
+          REFERENCES held_orders(id)
+          ON DELETE SET NULL;
+        END IF;
+      END$$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'qr_customer_requests_approved_customer_id_fk'
+        ) THEN
+          ALTER TABLE qr_customer_requests
+          ADD CONSTRAINT qr_customer_requests_approved_customer_id_fk
+          FOREIGN KEY (approved_customer_id)
           REFERENCES customers(id)
           ON DELETE SET NULL;
         END IF;
@@ -1202,6 +1310,18 @@ export async function runAppMigrations() {
     );
     await client.query(
       `CREATE INDEX IF NOT EXISTS idx_held_orders_branch_id ON held_orders(branch_id)`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_qr_customer_requests_phone ON qr_customer_requests(customer_phone)`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_qr_customer_requests_status_requested ON qr_customer_requests(status, requested_at DESC)`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_qr_customer_requests_branch_status ON qr_customer_requests(branch_id, status, requested_at DESC)`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_qr_customer_requests_held_order_id ON qr_customer_requests(held_order_id)`
     );
     await client.query(
       `CREATE INDEX IF NOT EXISTS idx_cash_shifts_branch_id ON cash_shifts(branch_id)`

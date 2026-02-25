@@ -37,6 +37,20 @@ function normalizePhone(value) {
     .slice(0, 30);
 }
 
+function normalizeEmail(value) {
+  const email = String(value || "")
+    .trim()
+    .toLowerCase()
+    .slice(0, 120);
+  if (!email) {
+    return null;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return null;
+  }
+  return email;
+}
+
 function normalizeText(value, maxLength = 120) {
   return String(value || "")
     .replace(/\s+/g, " ")
@@ -61,6 +75,112 @@ function normalizePaymentMethod(value) {
 function normalizeCategory(value) {
   const category = normalizeText(value, 60);
   return category || "Other";
+}
+
+async function findActiveCustomerByPhone(client, phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) {
+    return null;
+  }
+  const { rows } = await client.query(
+    `SELECT id, full_name, phone, email, address
+     FROM customers
+     WHERE phone = $1
+       AND is_active = TRUE
+     LIMIT 1`,
+    [normalizedPhone]
+  );
+  return rows[0] || null;
+}
+
+async function upsertQrCustomerRequest(
+  client,
+  {
+    branchId,
+    heldOrderId,
+    customerName,
+    customerPhone,
+    customerEmail,
+    customerAddress,
+    meta = {},
+  }
+) {
+  const normalizedPhone = normalizePhone(customerPhone);
+  if (!normalizedPhone) {
+    return null;
+  }
+
+  const safeMeta =
+    meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {};
+
+  const existingRes = await client.query(
+    `SELECT id
+     FROM qr_customer_requests
+     WHERE customer_phone = $1
+       AND COALESCE(branch_id, 1) = $2
+       AND status = 'PENDING'
+     ORDER BY requested_at DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedPhone, Number(branchId || 1)]
+  );
+  const existing = existingRes.rows[0];
+
+  if (existing) {
+    const { rows } = await client.query(
+      `UPDATE qr_customer_requests
+       SET held_order_id = $2,
+           customer_name = $3,
+           customer_email = $4,
+           customer_address = $5,
+           request_count = COALESCE(request_count, 0) + 1,
+           last_order_at = NOW(),
+           requested_at = NOW(),
+           updated_at = NOW(),
+           meta = COALESCE(meta, '{}'::jsonb) || $6::jsonb
+       WHERE id = $1
+       RETURNING id, status`,
+      [
+        Number(existing.id),
+        Number(heldOrderId || 0) || null,
+        customerName,
+        customerEmail || null,
+        customerAddress || null,
+        JSON.stringify(safeMeta),
+      ]
+    );
+    return rows[0] || null;
+  }
+
+  const { rows } = await client.query(
+    `INSERT INTO qr_customer_requests (
+       branch_id,
+       held_order_id,
+       source,
+       customer_name,
+       customer_phone,
+       customer_email,
+       customer_address,
+       status,
+       request_count,
+       meta,
+       requested_at,
+       last_order_at,
+       updated_at
+     )
+     VALUES ($1, $2, 'QR_MENU', $3, $4, $5, $6, 'PENDING', 1, $7::jsonb, NOW(), NOW(), NOW())
+     RETURNING id, status`,
+    [
+      Number(branchId || 1),
+      Number(heldOrderId || 0) || null,
+      customerName,
+      normalizedPhone,
+      customerEmail || null,
+      customerAddress || null,
+      JSON.stringify(safeMeta),
+    ]
+  );
+  return rows[0] || null;
 }
 
 async function resolvePublicBranch(client, { branchId = null, branchCode = "" } = {}) {
@@ -143,6 +263,12 @@ function formatQrOrderReference(id) {
   return `QRM${String(safeId).padStart(6, "0")}`;
 }
 
+function formatQrInvoiceNumber(id) {
+  const parsed = Number.parseInt(id, 10);
+  const safeId = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  return `VOXO${String(safeId).padStart(6, "0")}`;
+}
+
 router.get("/menu", async (req, res) => {
   const requestedBranchCode = normalizeBranchCode(
     req.query.branch_code ?? req.query.branchCode
@@ -198,11 +324,41 @@ router.get("/menu", async (req, res) => {
   }
 });
 
+router.get("/customer-profile", async (req, res) => {
+  const customerPhone = normalizePhone(req.query.phone);
+  if (!customerPhone || customerPhone.length < 7) {
+    return res.status(400).json({ message: "Valid phone is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const customer = await findActiveCustomerByPhone(client, customerPhone);
+    return res.json({
+      customer: customer
+        ? {
+            id: customer.id,
+            full_name: customer.full_name,
+            phone: customer.phone,
+            email: customer.email || null,
+            address: customer.address || null,
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error("Failed to lookup public customer profile:", err);
+    return res.status(500).json({ message: "Failed to lookup customer profile" });
+  } finally {
+    client.release();
+  }
+});
+
 router.post("/orders", async (req, res) => {
   const requestedBranchCode = normalizeBranchCode(req.body?.branch_code);
   const requestedBranchId = parsePositiveInt(req.body?.branch_id, NaN, 1, 1_000_000);
   const customerName = normalizeText(req.body?.customer_name, 120);
   const customerPhone = normalizePhone(req.body?.customer_phone);
+  const customerEmail = normalizeEmail(req.body?.customer_email);
+  const customerAddress = normalizeText(req.body?.customer_address, 500);
   const orderType = normalizeOrderType(req.body?.order_type);
   const tableNumber = normalizeText(req.body?.table_number, 50);
   const note = normalizeText(req.body?.note, 500);
@@ -237,6 +393,9 @@ router.post("/orders", async (req, res) => {
 
     const menuProducts = await fetchBranchMenuProducts(client, branch.id);
     const productMap = new Map(menuProducts.map((product) => [String(product.id), product]));
+    const existingCustomer = customerPhone
+      ? await findActiveCustomerByPhone(client, customerPhone)
+      : null;
 
     const missingProducts = uniqueProductIds.filter(
       (productId) => !productMap.has(String(productId))
@@ -290,11 +449,50 @@ router.post("/orders", async (req, res) => {
           channel: "WEB",
           payment_method: paymentMethod,
           note: note || null,
+          customer_email: customerEmail || null,
+          customer_address: customerAddress || null,
+          crm_customer_id: existingCustomer?.id || null,
+          crm_customer_status: existingCustomer ? "MATCHED" : "PENDING_APPROVAL",
           estimated_total: estimatedTotal,
         }),
       ]
     );
     const heldOrder = heldRes.rows[0];
+    const invoiceNumber = formatQrInvoiceNumber(heldOrder.id);
+    const reference = formatQrOrderReference(heldOrder.id);
+
+    await client.query(
+      `UPDATE held_orders
+       SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb
+       WHERE id = $1`,
+      [
+        heldOrder.id,
+        JSON.stringify({
+          invoice_number: invoiceNumber,
+          reference,
+        }),
+      ]
+    );
+
+    let customerRequest = null;
+    if (customerPhone && !existingCustomer) {
+      customerRequest = await upsertQrCustomerRequest(client, {
+        branchId: Number(branch.id),
+        heldOrderId: Number(heldOrder.id),
+        customerName,
+        customerPhone,
+        customerEmail,
+        customerAddress,
+        meta: {
+          source: "QR_MENU",
+          payment_method: paymentMethod,
+          table_number: tableNumber || null,
+          note: note || null,
+          invoice_number: invoiceNumber,
+          reference,
+        },
+      });
+    }
 
     await client.query(
       `INSERT INTO audit_logs (action, entity_type, entity_id, actor_id, actor_role, payload)
@@ -304,9 +502,12 @@ router.post("/orders", async (req, res) => {
         JSON.stringify({
           branch_id: Number(branch.id),
           customer_name: customerName,
+          customer_phone: customerPhone || null,
           items_count: heldItems.length,
           estimated_total: estimatedTotal,
           source: "QR_MENU",
+          crm_customer_id: existingCustomer?.id || null,
+          customer_request_id: customerRequest?.id || null,
         }),
       ]
     );
@@ -315,8 +516,12 @@ router.post("/orders", async (req, res) => {
 
     return res.status(201).json({
       message: "Order submitted successfully",
-      reference: formatQrOrderReference(heldOrder.id),
+      reference,
+      invoice_number: invoiceNumber,
       held_order_id: Number(heldOrder.id),
+      crm_customer_id: existingCustomer?.id || null,
+      customer_request_id: customerRequest?.id || null,
+      customer_request_status: customerRequest?.status || null,
       created_at: heldOrder.created_at,
       branch: {
         id: Number(branch.id),

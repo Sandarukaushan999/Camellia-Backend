@@ -280,6 +280,12 @@ function parsePositiveInt(value, fallback, min, max) {
   return Math.max(min, Math.min(max, parsed));
 }
 
+function formatHeldInvoiceNumber(heldOrderId) {
+  const parsed = Number.parseInt(heldOrderId, 10);
+  const safeId = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  return `VOXO${String(safeId).padStart(6, "0")}`;
+}
+
 function normalizeHeldItems(items) {
   if (!Array.isArray(items)) {
     return [];
@@ -331,6 +337,14 @@ function normalizeHeldMeta(metaInput) {
 }
 
 function mapHeldOrderRow(row) {
+  const meta =
+    row.meta && typeof row.meta === "object" && !Array.isArray(row.meta)
+      ? row.meta
+      : {};
+  const heldId = Number(row.id || 0) || row.id;
+  const invoiceNumber =
+    String(meta.invoice_number || "").trim() || formatHeldInvoiceNumber(heldId);
+
   return {
     id: row.id,
     branch_id: row.branch_id ? Number(row.branch_id) : null,
@@ -338,11 +352,13 @@ function mapHeldOrderRow(row) {
     table_number: row.table_number,
     customer_name: row.customer_name,
     customer_phone: row.customer_phone,
+    invoice_number: invoiceNumber,
     items: Array.isArray(row.items) ? row.items : [],
-    meta:
-      row.meta && typeof row.meta === "object" && !Array.isArray(row.meta)
-        ? row.meta
-        : {},
+    meta,
+    source: meta.source ? String(meta.source).trim().toUpperCase() : null,
+    payment_method: meta.payment_method || null,
+    note: meta.note || null,
+    reference: meta.reference || null,
     created_at: row.created_at,
     created_by: row.created_by,
     created_by_username: row.created_by_username || null,

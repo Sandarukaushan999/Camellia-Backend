@@ -1,6 +1,7 @@
 import express from "express";
 import multer from "multer";
 import bcrypt from "bcrypt";
+import { randomUUID } from "crypto";
 import auth from "../middleware/auth.js";
 import authorize, { authorizePermissions } from "../middleware/authorize.js";
 import pool from "../db.js";
@@ -28,6 +29,7 @@ const BACKUP_TABLES = [
   "customer_loyalty_txns",
   "customer_campaigns",
   "held_orders",
+  "qr_customer_requests",
   "cash_shifts",
   "expenses",
   "suppliers",
@@ -68,6 +70,7 @@ const RESTORE_ORDER = [
   "purchase_orders",
   "orders",
   "held_orders",
+  "qr_customer_requests",
   "cash_shifts",
   "expenses",
   "goods_receipts",
@@ -141,6 +144,7 @@ const RESETTABLE_TABLES = [
   "products",
   "backup_jobs",
   "held_orders",
+  "qr_customer_requests",
 ];
 
 function parsePositiveInt(value, fallback, min, max) {
@@ -165,6 +169,13 @@ function parseBranchId(value, fallback = 1) {
     return fallback;
   }
   return parsed;
+}
+
+function normalizePhone(value) {
+  return String(value || "")
+    .replace(/[^\d+]/g, "")
+    .trim()
+    .slice(0, 30);
 }
 
 const USER_BASE_ROLES = new Set(["ADMIN", "CASHIER"]);
@@ -1301,6 +1312,318 @@ router.get("/sales", auth, authorize("ADMIN"), async (req, res) => {
     return res.status(500).json({ message: "Failed to fetch sales ledger" });
   }
 });
+
+// QR customer intake requests (admin approval flow)
+router.get("/qr-customer-requests", auth, authorize("ADMIN"), async (req, res) => {
+  try {
+    const statusInput = String(req.query.status || "PENDING")
+      .trim()
+      .toUpperCase();
+    const status = ["ALL", "PENDING", "APPROVED", "REJECTED"].includes(statusInput)
+      ? statusInput
+      : "PENDING";
+    const limit = parsePositiveInt(req.query.limit, 200, 1, 1000);
+    const branchId = parsePositiveInt(
+      req.query.branch_id ?? req.query.branchId,
+      NaN,
+      1,
+      1_000_000
+    );
+    const search = String(req.query.search || "")
+      .trim()
+      .slice(0, 80);
+
+    const params = [limit];
+    const where = ["true"];
+
+    if (status !== "ALL") {
+      params.push(status);
+      where.push(`qcr.status = $${params.length}`);
+    }
+    if (Number.isFinite(branchId)) {
+      params.push(branchId);
+      where.push(`COALESCE(qcr.branch_id, 1) = $${params.length}`);
+    }
+    if (search) {
+      const escaped = search.replace(/[\\%_]/g, "\\$&");
+      params.push(`%${escaped}%`);
+      where.push(`(
+        COALESCE(qcr.customer_name, '') ILIKE $${params.length} ESCAPE '\\'
+        OR COALESCE(qcr.customer_phone, '') ILIKE $${params.length} ESCAPE '\\'
+        OR COALESCE(ho.meta->>'invoice_number', '') ILIKE $${params.length} ESCAPE '\\'
+      )`);
+    }
+
+    const { rows } = await pool.query(
+      `SELECT
+         qcr.id,
+         qcr.branch_id,
+         qcr.held_order_id,
+         qcr.source,
+         qcr.customer_name,
+         qcr.customer_phone,
+         qcr.customer_email,
+         qcr.customer_address,
+         qcr.status,
+         qcr.request_count,
+         qcr.meta,
+         qcr.requested_at,
+         qcr.last_order_at,
+         qcr.reviewed_at,
+         qcr.reviewed_by,
+         qcr.review_note,
+         qcr.approved_customer_id,
+         qcr.created_at,
+         qcr.updated_at,
+         c.full_name AS approved_customer_name,
+         ho.meta->>'invoice_number' AS invoice_number,
+         ho.meta->>'reference' AS reference
+       FROM qr_customer_requests qcr
+       LEFT JOIN customers c ON c.id = qcr.approved_customer_id
+       LEFT JOIN held_orders ho ON ho.id = qcr.held_order_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY qcr.requested_at DESC
+       LIMIT $1`,
+      params
+    );
+
+    return res.json(
+      rows.map((row) => ({
+        ...row,
+        branch_id: row.branch_id ? Number(row.branch_id) : null,
+        held_order_id: row.held_order_id ? Number(row.held_order_id) : null,
+        request_count: Number(row.request_count || 0),
+        meta:
+          row.meta && typeof row.meta === "object" && !Array.isArray(row.meta)
+            ? row.meta
+            : {},
+      }))
+    );
+  } catch (err) {
+    console.error("Failed to fetch QR customer requests:", err);
+    return res.status(500).json({ message: "Failed to fetch QR customer requests" });
+  }
+});
+
+router.post(
+  "/qr-customer-requests/:id/approve",
+  auth,
+  authorize("ADMIN"),
+  async (req, res) => {
+    const requestId = parsePositiveInt(req.params.id, NaN, 1, 1_000_000_000);
+    if (!Number.isFinite(requestId)) {
+      return res.status(400).json({ message: "Invalid request id" });
+    }
+
+    const reviewNote = req.body?.review_note
+      ? String(req.body.review_note).trim().slice(0, 500)
+      : null;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const requestRes = await client.query(
+        `SELECT *
+         FROM qr_customer_requests
+         WHERE id = $1
+         FOR UPDATE`,
+        [requestId]
+      );
+      const request = requestRes.rows[0];
+      if (!request) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Customer request not found" });
+      }
+      if (String(request.status || "").toUpperCase() !== "PENDING") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Only pending requests can be approved" });
+      }
+
+      const phone = normalizePhone(request.customer_phone);
+      if (!phone) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Request does not contain a valid phone number" });
+      }
+
+      const name = String(request.customer_name || "").trim().slice(0, 120) || "QR Customer";
+      const email = request.customer_email
+        ? String(request.customer_email).trim().slice(0, 120)
+        : null;
+      const address = request.customer_address
+        ? String(request.customer_address).trim().slice(0, 500)
+        : null;
+
+      const existingCustomerRes = await client.query(
+        `SELECT id, full_name, phone, email, address
+         FROM customers
+         WHERE phone = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [phone]
+      );
+
+      let customer = existingCustomerRes.rows[0] || null;
+      if (customer) {
+        const { rows } = await client.query(
+          `UPDATE customers
+           SET full_name = COALESCE(NULLIF($2, ''), full_name),
+               email = COALESCE(NULLIF($3, ''), email),
+               address = COALESCE(NULLIF($4, ''), address),
+               is_active = TRUE,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING id, full_name, phone, email, address`,
+          [customer.id, name, email || "", address || ""]
+        );
+        customer = rows[0] || customer;
+      } else {
+        const customerId = randomUUID();
+        const { rows } = await client.query(
+          `INSERT INTO customers (id, full_name, phone, email, address, is_active)
+           VALUES ($1, $2, $3, $4, $5, TRUE)
+           RETURNING id, full_name, phone, email, address`,
+          [customerId, name, phone, email, address]
+        );
+        customer = rows[0];
+      }
+
+      const requestUpdateRes = await client.query(
+        `UPDATE qr_customer_requests
+         SET status = 'APPROVED',
+             reviewed_at = NOW(),
+             reviewed_by = $2,
+             review_note = COALESCE($3, review_note),
+             approved_customer_id = $4,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [requestId, String(req.user.id), reviewNote, customer.id]
+      );
+      const updatedRequest = requestUpdateRes.rows[0];
+
+      if (updatedRequest?.held_order_id) {
+        await client.query(
+          `UPDATE held_orders
+           SET customer_name = COALESCE(customer_name, $2),
+               customer_phone = COALESCE(customer_phone, $3),
+               meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                 'crm_customer_id', $4,
+                 'crm_customer_status', 'APPROVED'
+               )
+           WHERE id = $1`,
+          [updatedRequest.held_order_id, customer.full_name, customer.phone, customer.id]
+        );
+      }
+
+      await writeAuditLog(client, {
+        action: "QR_CUSTOMER_REQUEST_APPROVE",
+        entity_type: "qr_customer_request",
+        entity_id: String(requestId),
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          approved_customer_id: customer.id,
+          held_order_id: updatedRequest?.held_order_id || null,
+        },
+      });
+
+      await client.query("COMMIT");
+      return res.json({
+        message: "Customer request approved",
+        request: updatedRequest,
+        customer,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Failed to approve QR customer request:", err);
+      return res.status(500).json({ message: "Failed to approve customer request" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.post(
+  "/qr-customer-requests/:id/reject",
+  auth,
+  authorize("ADMIN"),
+  async (req, res) => {
+    const requestId = parsePositiveInt(req.params.id, NaN, 1, 1_000_000_000);
+    if (!Number.isFinite(requestId)) {
+      return res.status(400).json({ message: "Invalid request id" });
+    }
+    const reviewNote = String(req.body?.review_note || "").trim().slice(0, 500);
+    if (!reviewNote) {
+      return res.status(400).json({ message: "Rejection reason is required" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const requestRes = await client.query(
+        `SELECT *
+         FROM qr_customer_requests
+         WHERE id = $1
+         FOR UPDATE`,
+        [requestId]
+      );
+      const request = requestRes.rows[0];
+      if (!request) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Customer request not found" });
+      }
+      if (String(request.status || "").toUpperCase() !== "PENDING") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Only pending requests can be rejected" });
+      }
+
+      const { rows } = await client.query(
+        `UPDATE qr_customer_requests
+         SET status = 'REJECTED',
+             reviewed_at = NOW(),
+             reviewed_by = $2,
+             review_note = $3,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [requestId, String(req.user.id), reviewNote]
+      );
+      const updatedRequest = rows[0];
+
+      if (updatedRequest?.held_order_id) {
+        await client.query(
+          `UPDATE held_orders
+           SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+             'crm_customer_status', 'REJECTED'
+           )
+           WHERE id = $1`,
+          [updatedRequest.held_order_id]
+        );
+      }
+
+      await writeAuditLog(client, {
+        action: "QR_CUSTOMER_REQUEST_REJECT",
+        entity_type: "qr_customer_request",
+        entity_id: String(requestId),
+        actor_id: req.user.id,
+        actor_role: req.user.role,
+        payload: {
+          held_order_id: updatedRequest?.held_order_id || null,
+          review_note: reviewNote,
+        },
+      });
+
+      await client.query("COMMIT");
+      return res.json({ message: "Customer request rejected", request: updatedRequest });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Failed to reject QR customer request:", err);
+      return res.status(500).json({ message: "Failed to reject customer request" });
+    } finally {
+      client.release();
+    }
+  }
+);
 
 // Sales reports with filters
 router.get("/reports/sales", auth, authorize("ADMIN"), async (req, res) => {

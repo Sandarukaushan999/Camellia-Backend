@@ -113,11 +113,21 @@ async function startServer() {
     }
 
     await runAppMigrations();
-    app.listen(port, () => {
+    const server = app.listen(port, () => {
       // eslint-disable-next-line no-console
       console.log(`Backend listening on port ${port}`);
       startDailyBackupScheduler();
       startReportExportScheduler();
+    });
+    server.on("error", (err) => {
+      if (err?.code === "EADDRINUSE") {
+        console.error(
+          `Port ${port} is already in use. Stop the existing backend process before starting a new one.`
+        );
+        process.exit(1);
+      }
+      console.error("Server failed to start:", err);
+      process.exit(1);
     });
   } catch (err) {
     console.error("Failed to start backend:", err);
