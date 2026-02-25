@@ -16,6 +16,12 @@ function quoteIdentifier(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
 }
 
+function formatMigrationError(err) {
+  const message = err?.message || String(err);
+  const code = err?.code ? ` (${err.code})` : "";
+  return `${message}${code}`;
+}
+
 async function dropForeignKeysOnColumn(client, tableName, columnName) {
   const { rows } = await client.query(
     `SELECT tc.constraint_name
@@ -1409,7 +1415,7 @@ export async function runAppMigrations() {
     console.log("Database migrations completed");
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("Database migration failed:", err);
+    console.error("Database migration failed:", formatMigrationError(err));
     throw err;
   } finally {
     client.release();

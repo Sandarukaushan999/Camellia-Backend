@@ -8,10 +8,65 @@ const configuredTimezone = String(process.env.APP_TIMEZONE || "Asia/Colombo").tr
 const appTimezone = /^[A-Za-z0-9_+\-/]+$/.test(configuredTimezone)
   ? configuredTimezone
   : "Asia/Colombo";
+const databaseUrl = String(process.env.DATABASE_URL || "").trim();
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+function isTrueFlag(value) {
+  return String(value || "").trim().toLowerCase() === "true";
+}
+
+function toInteger(value, fallbackValue) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
+}
+
+function shouldUseSsl(urlValue) {
+  if (isTrueFlag(process.env.DATABASE_SSL) || isTrueFlag(process.env.DB_SSL)) {
+    return true;
+  }
+
+  const rawSslMode = String(process.env.PGSSLMODE || "").trim().toLowerCase();
+  if (
+    rawSslMode === "require" ||
+    rawSslMode === "verify-ca" ||
+    rawSslMode === "verify-full"
+  ) {
+    return true;
+  }
+
+  if (!urlValue) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(urlValue);
+    const sslModeFromUrl = String(
+      parsed.searchParams.get("sslmode") || ""
+    ).toLowerCase();
+    return (
+      sslModeFromUrl === "require" ||
+      sslModeFromUrl === "verify-ca" ||
+      sslModeFromUrl === "verify-full"
+    );
+  } catch {
+    return false;
+  }
+}
+
+const poolConfig = {
+  connectionString: databaseUrl,
+  connectionTimeoutMillis: toInteger(
+    process.env.DATABASE_CONNECTION_TIMEOUT_MS,
+    10000
+  ),
+};
+
+if (shouldUseSsl(databaseUrl)) {
+  poolConfig.ssl = {
+    rejectUnauthorized: !isTrueFlag(process.env.DATABASE_SSL_ALLOW_SELF_SIGNED),
+  };
+}
+
+const pool = new Pool(poolConfig);
 
 pool.on("connect", (client) => {
   client

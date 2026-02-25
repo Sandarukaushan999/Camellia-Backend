@@ -147,12 +147,112 @@ app.use("/api/analytics", analyticsRoutes);
 app.use("/api/public", publicRoutes);
 
 const port = process.env.PORT || 4000;
+const retryableDbErrorCodes = new Set([
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNRESET",
+  "57P03", // cannot_connect_now
+]);
+
+function toInteger(value, fallbackValue) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getDatabaseEndpointSummary() {
+  const rawDatabaseUrl = String(process.env.DATABASE_URL || "").trim();
+  if (!rawDatabaseUrl) {
+    return {
+      target: "missing DATABASE_URL",
+      hint:
+        "Set DATABASE_URL in your backend environment variables before deployment.",
+    };
+  }
+
+  try {
+    const parsed = new URL(rawDatabaseUrl);
+    const host = parsed.hostname || "unknown-host";
+    const portFromUrl = parsed.port || "5432";
+    const isPrivateIpv4 =
+      /^10\.\d+\.\d+\.\d+$/.test(host) ||
+      /^127\.\d+\.\d+\.\d+$/.test(host) ||
+      /^192\.168\.\d+\.\d+$/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/.test(host);
+    const isLocalHost = host === "localhost";
+
+    if (isLocalHost || isPrivateIpv4) {
+      return {
+        target: `${host}:${portFromUrl}`,
+        hint:
+          "DATABASE_URL points to a local/private host. Use a public or same-network PostgreSQL endpoint for this deployment target.",
+      };
+    }
+
+    return { target: `${host}:${portFromUrl}`, hint: "" };
+  } catch {
+    return {
+      target: "invalid DATABASE_URL",
+      hint:
+        "DATABASE_URL is malformed. Use format: postgres://user:pass@host:5432/dbname",
+    };
+  }
+}
+
+function formatStartupError(err) {
+  const code = err?.code ? ` (${err.code})` : "";
+  const message = err?.message || String(err);
+  return `${message}${code}`;
+}
+
+function isRetryableDbError(err) {
+  return retryableDbErrorCodes.has(String(err?.code || "").toUpperCase());
+}
+
+async function runMigrationsWithRetry() {
+  const maxAttempts = toInteger(process.env.DB_CONNECT_RETRY_ATTEMPTS, 6);
+  const baseDelayMs = toInteger(process.env.DB_CONNECT_RETRY_DELAY_MS, 2000);
+  const { target, hint } = getDatabaseEndpointSummary();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await runAppMigrations();
+      return;
+    } catch (err) {
+      const shouldRetry = attempt < maxAttempts && isRetryableDbError(err);
+      console.error(
+        `Database startup check failed (attempt ${attempt}/${maxAttempts}) for ${target}: ${formatStartupError(
+          err
+        )}`
+      );
+      if (hint) {
+        console.error(hint);
+      }
+      if (!shouldRetry) {
+        throw err;
+      }
+
+      const backoffDelayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), 15000);
+      console.error(`Retrying database connection in ${backoffDelayMs}ms...`);
+      await sleep(backoffDelayMs);
+    }
+  }
+}
 
 async function startServer() {
   try {
     const jwtSecret = String(process.env.JWT_SECRET || "").trim();
+    const databaseUrl = String(process.env.DATABASE_URL || "").trim();
     if (!jwtSecret) {
       throw new Error("JWT_SECRET is required");
+    }
+    if (!databaseUrl) {
+      throw new Error("DATABASE_URL is required");
     }
     if (isWeakJwtSecret(jwtSecret)) {
       const warningMessage =
@@ -163,7 +263,7 @@ async function startServer() {
       console.warn(warningMessage);
     }
 
-    await runAppMigrations();
+    await runMigrationsWithRetry();
     const server = app.listen(port, () => {
       // eslint-disable-next-line no-console
       console.log(`Backend listening on port ${port}`);
@@ -181,7 +281,7 @@ async function startServer() {
       process.exit(1);
     });
   } catch (err) {
-    console.error("Failed to start backend:", err);
+    console.error("Failed to start backend:", formatStartupError(err));
     process.exit(1);
   }
 }
