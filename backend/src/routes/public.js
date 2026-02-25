@@ -5,6 +5,14 @@ const router = express.Router();
 
 const ORDER_TYPES = new Set(["DINE-IN", "TAKEAWAY", "DELIVERY"]);
 const PAYMENT_METHODS = new Set(["CASH", "CARD", "QR", "ONLINE", "OTHER"]);
+const RETRYABLE_DB_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNRESET",
+  "57P03", // cannot_connect_now
+]);
 
 function parsePositiveInt(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
@@ -75,6 +83,28 @@ function normalizePaymentMethod(value) {
 function normalizeCategory(value) {
   const category = normalizeText(value, 60);
   return category || "Other";
+}
+
+function formatError(err) {
+  const message = err?.message || String(err);
+  const code = err?.code ? ` (${err.code})` : "";
+  return `${message}${code}`;
+}
+
+function statusFromDbError(err) {
+  const code = String(err?.code || "").trim().toUpperCase();
+  return RETRYABLE_DB_ERROR_CODES.has(code) ? 503 : 500;
+}
+
+function handlePublicRouteError(res, logPrefix, err, fallbackMessage) {
+  const status = statusFromDbError(err);
+  console.error(`${logPrefix}: ${formatError(err)}`);
+  if (status === 503) {
+    return res.status(503).json({
+      message: "Service temporarily unavailable. Please try again in a moment.",
+    });
+  }
+  return res.status(status).json({ message: fallbackMessage });
 }
 
 async function findActiveCustomerByPhone(client, phone) {
@@ -280,8 +310,9 @@ router.get("/menu", async (req, res) => {
     1_000_000
   );
 
-  const client = await pool.connect();
+  let client = null;
   try {
+    client = await pool.connect();
     const branch = await resolvePublicBranch(client, {
       branchId: requestedBranchId,
       branchCode: requestedBranchCode,
@@ -317,10 +348,9 @@ router.get("/menu", async (req, res) => {
       items,
     });
   } catch (err) {
-    console.error("Failed to load public menu:", err);
-    return res.status(500).json({ message: "Failed to load menu" });
+    return handlePublicRouteError(res, "Failed to load public menu", err, "Failed to load menu");
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -330,8 +360,9 @@ router.get("/customer-profile", async (req, res) => {
     return res.status(400).json({ message: "Valid phone is required" });
   }
 
-  const client = await pool.connect();
+  let client = null;
   try {
+    client = await pool.connect();
     const customer = await findActiveCustomerByPhone(client, customerPhone);
     return res.json({
       customer: customer
@@ -345,10 +376,14 @@ router.get("/customer-profile", async (req, res) => {
         : null,
     });
   } catch (err) {
-    console.error("Failed to lookup public customer profile:", err);
-    return res.status(500).json({ message: "Failed to lookup customer profile" });
+    return handlePublicRouteError(
+      res,
+      "Failed to lookup public customer profile",
+      err,
+      "Failed to lookup customer profile"
+    );
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -381,8 +416,9 @@ router.post("/orders", async (req, res) => {
   }
 
   const uniqueProductIds = [...new Set(requestedItems.map((item) => item.product_id))];
-  const client = await pool.connect();
+  let client = null;
   try {
+    client = await pool.connect();
     const branch = await resolvePublicBranch(client, {
       branchId: requestedBranchId,
       branchCode: requestedBranchCode,
@@ -531,15 +567,21 @@ router.post("/orders", async (req, res) => {
       estimated_total: estimatedTotal,
     });
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      // ignore rollback errors
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback errors
+      }
     }
-    console.error("Failed to create QR menu order:", err);
-    return res.status(500).json({ message: "Failed to submit order" });
+    return handlePublicRouteError(
+      res,
+      "Failed to create QR menu order",
+      err,
+      "Failed to submit order"
+    );
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
