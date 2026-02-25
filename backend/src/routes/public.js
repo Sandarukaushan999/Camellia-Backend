@@ -13,6 +13,12 @@ const RETRYABLE_DB_ERROR_CODES = new Set([
   "ECONNRESET",
   "57P03", // cannot_connect_now
 ]);
+const PUBLIC_DB_CONNECT_TIMEOUT_MS = parsePositiveInt(
+  process.env.PUBLIC_DB_CONNECT_TIMEOUT_MS,
+  12000,
+  1000,
+  120000
+);
 
 function parsePositiveInt(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
@@ -105,6 +111,28 @@ function handlePublicRouteError(res, logPrefix, err, fallbackMessage) {
     });
   }
   return res.status(status).json({ message: fallbackMessage });
+}
+
+async function connectPublicDbClient() {
+  let timeoutHandle = null;
+  try {
+    return await Promise.race([
+      pool.connect(),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const timeoutError = new Error(
+            `Timed out waiting for database connection after ${PUBLIC_DB_CONNECT_TIMEOUT_MS}ms`
+          );
+          timeoutError.code = "ETIMEDOUT";
+          reject(timeoutError);
+        }, PUBLIC_DB_CONNECT_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
 }
 
 async function findActiveCustomerByPhone(client, phone) {
@@ -312,7 +340,7 @@ router.get("/menu", async (req, res) => {
 
   let client = null;
   try {
-    client = await pool.connect();
+    client = await connectPublicDbClient();
     const branch = await resolvePublicBranch(client, {
       branchId: requestedBranchId,
       branchCode: requestedBranchCode,
@@ -362,7 +390,7 @@ router.get("/customer-profile", async (req, res) => {
 
   let client = null;
   try {
-    client = await pool.connect();
+    client = await connectPublicDbClient();
     const customer = await findActiveCustomerByPhone(client, customerPhone);
     return res.json({
       customer: customer
@@ -418,7 +446,7 @@ router.post("/orders", async (req, res) => {
   const uniqueProductIds = [...new Set(requestedItems.map((item) => item.product_id))];
   let client = null;
   try {
-    client = await pool.connect();
+    client = await connectPublicDbClient();
     const branch = await resolvePublicBranch(client, {
       branchId: requestedBranchId,
       branchCode: requestedBranchCode,
