@@ -14,6 +14,8 @@ const router = express.Router();
 
 const allowedOrderTypes = new Set(["DINE-IN", "TAKEAWAY", "DELIVERY", "OTHER"]);
 const allowedChannels = new Set(["POS", "PHONE", "WHATSAPP", "WEB", "OTHER"]);
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function normalizePhone(phone) {
   return String(phone || "").replace(/[^\d+]/g, "").trim();
@@ -35,6 +37,14 @@ function parseMoney(value, fallback = 0) {
     return fallback;
   }
   return Math.round(parsed * 100) / 100;
+}
+
+function normalizeProductId(value) {
+  return String(value ?? "").trim();
+}
+
+function isUuid(value) {
+  return UUID_PATTERN.test(normalizeProductId(value));
 }
 
 function formatInvoiceNumber(orderId) {
@@ -258,6 +268,52 @@ async function adjustInventoryInTransaction(client, items, direction = "DEDUCT")
   }
 }
 
+async function resolveProductUuidForOrderItem(client, item, branchId) {
+  const rawProductId = normalizeProductId(item?.product_id ?? item?.id);
+  if (isUuid(rawProductId)) {
+    return rawProductId;
+  }
+
+  if (rawProductId) {
+    const byCode = await client.query(
+      `SELECT p.id::text AS id
+       FROM products p
+       WHERE p.code = $1
+       LIMIT 1`,
+      [rawProductId]
+    );
+    const codeMatch = normalizeProductId(byCode.rows[0]?.id);
+    if (isUuid(codeMatch)) {
+      return codeMatch;
+    }
+  }
+
+  const rawName = String(item?.name || "").trim().slice(0, 120);
+  if (!rawName) {
+    return null;
+  }
+
+  const byName = await client.query(
+    `SELECT p.id::text AS id
+     FROM products p
+     LEFT JOIN branch_products bp
+       ON bp.branch_id = $2
+      AND bp.product_id = p.id::text
+     WHERE LOWER(TRIM(p.name)) = LOWER(TRIM($1))
+       AND (
+         CASE
+           WHEN bp.id IS NULL THEN COALESCE(p."isActive", TRUE)
+           ELSE COALESCE(bp.is_active, TRUE)
+         END
+       ) = TRUE
+     ORDER BY p.name ASC
+     LIMIT 1`,
+    [rawName, branchId]
+  );
+  const nameMatch = normalizeProductId(byName.rows[0]?.id);
+  return isUuid(nameMatch) ? nameMatch : null;
+}
+
 async function writeOrderAudit(clientOrPool, user, action, entityId, payload = {}) {
   await clientOrPool.query(
     `INSERT INTO audit_logs (action, entity_type, entity_id, actor_id, actor_role, payload)
@@ -293,7 +349,7 @@ function normalizeHeldItems(items) {
 
   return items
     .map((item) => {
-      const productId = Number.parseInt(item?.product_id ?? item?.id, 10);
+      const productId = normalizeProductId(item?.product_id ?? item?.id);
       const qty = Number.parseFloat(item?.qty);
       const price = parseMoney(item?.price, NaN);
       const name = String(item?.name || "").trim().slice(0, 120);
@@ -301,7 +357,7 @@ function normalizeHeldItems(items) {
         ? String(item.category).trim().slice(0, 50)
         : null;
 
-      if (!Number.isFinite(productId) || !Number.isFinite(qty) || qty <= 0) {
+      if (!productId || !Number.isFinite(qty) || qty <= 0) {
         return null;
       }
       if (!Number.isFinite(price) || price < 0) {
@@ -932,6 +988,35 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
 
     pointsEarned = customerId ? computeEarnedPoints(computedTotal) : 0;
 
+    const normalizedOrderItems = [];
+    const unresolvedOrderItems = [];
+    for (const item of items) {
+      const qty = Number.parseInt(item?.qty, 10);
+      const price = parseMoney(item?.price, NaN);
+      if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(price) || price < 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Order contains invalid item qty/price" });
+      }
+
+      // Resolve legacy/ambiguous IDs (for example old numeric IDs) to UUID product IDs when possible.
+      // If unresolved, keep null so order capture does not fail at DB UUID casting.
+      // Inventory deduction is skipped automatically for unresolved products.
+      // The frontend now sends name to improve this resolution path.
+      // eslint-disable-next-line no-await-in-loop
+      const resolvedProductId = await resolveProductUuidForOrderItem(client, item, branchId);
+      if (!resolvedProductId) {
+        unresolvedOrderItems.push({
+          provided_product_id: normalizeProductId(item?.product_id ?? item?.id),
+          name: String(item?.name || "").trim() || null,
+        });
+      }
+      normalizedOrderItems.push({
+        product_id: resolvedProductId || null,
+        qty,
+        price,
+      });
+    }
+
     const orderResult = await client.query(
       `INSERT INTO orders
         (
@@ -976,14 +1061,18 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
       [orderId, invoiceNumber]
     );
 
-    const insertItems = items.map((item) =>
+    const insertNormalizedItems = normalizedOrderItems.map((item) =>
       client.query(
-        "INSERT INTO order_items (order_id, product_id, qty, price) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO order_items (order_id, product_id, qty, price) VALUES ($1, $2::uuid, $3, $4)",
         [orderId, item.product_id, item.qty, item.price]
       )
     );
-    await Promise.all(insertItems);
-    await adjustInventoryInTransaction(client, items, "DEDUCT");
+    await Promise.all(insertNormalizedItems);
+    await adjustInventoryInTransaction(
+      client,
+      normalizedOrderItems.filter((item) => item.product_id),
+      "DEDUCT"
+    );
 
     if (customerId) {
       if (loyaltyPointsRedeemed > 0) {
@@ -1028,6 +1117,8 @@ router.post("/", auth, authorize("ADMIN", "CASHIER"), async (req, res) => {
       order_type: orderType,
       channel,
       items_count: items.length,
+      unresolved_item_count: unresolvedOrderItems.length,
+      unresolved_items: unresolvedOrderItems,
     });
     await client.query("COMMIT");
 

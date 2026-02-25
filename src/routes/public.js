@@ -410,7 +410,7 @@ router.post("/orders", async (req, res) => {
     const heldItems = requestedItems.map((item) => {
       const product = productMap.get(String(item.product_id));
       return {
-        product_id: Number.parseInt(product.id, 10) || product.id,
+        product_id: String(product.id || "").trim(),
         name: product.name,
         category: product.category,
         qty: item.qty,
