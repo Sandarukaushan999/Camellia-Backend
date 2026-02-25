@@ -107,7 +107,17 @@ app.use((_, res, next) => {
   res.setHeader("Referrer-Policy", "same-origin");
   next();
 });
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
 
+const publicCors = cors({
+  origin: true,
+  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,
+  optionsSuccessStatus: 204,
+});
+
+app.use("/api/public", publicCors, publicRoutes);
 app.use(
   cors({
     origin(origin, callback) {
@@ -122,7 +132,6 @@ app.use(
     optionsSuccessStatus: 204,
   })
 );
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
 app.use((err, _req, res, next) => {
   if (err?.message === "Not allowed by CORS") {
     return res.status(403).json({ message: "CORS origin denied" });
@@ -144,7 +153,6 @@ app.use("/api/branches", branchRoutes);
 app.use("/api/supply", supplyRoutes);
 app.use("/api/operations", operationsRoutes);
 app.use("/api/analytics", analyticsRoutes);
-app.use("/api/public", publicRoutes);
 
 const port = process.env.PORT || 4000;
 const retryableDbErrorCodes = new Set([
