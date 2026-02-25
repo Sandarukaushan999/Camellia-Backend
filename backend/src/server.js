@@ -214,8 +214,9 @@ function getDatabaseEndpointSummary() {
 
 function formatStartupError(err) {
   const code = err?.code ? ` (${err.code})` : "";
+  const severity = err?.severity ? ` [${String(err.severity)}]` : "";
   const message = err?.message || String(err);
-  return `${message}${code}`;
+  return `${message}${code}${severity}`;
 }
 
 function isRetryableDbError(err) {
@@ -223,16 +224,23 @@ function isRetryableDbError(err) {
 }
 
 async function runMigrationsWithRetry() {
-  const maxAttempts = toInteger(process.env.DB_CONNECT_RETRY_ATTEMPTS, 6);
-  const baseDelayMs = toInteger(process.env.DB_CONNECT_RETRY_DELAY_MS, 2000);
+  const maxAttempts = toInteger(process.env.DB_CONNECT_RETRY_ATTEMPTS, 60);
+  const baseDelayMs = toInteger(process.env.DB_CONNECT_RETRY_DELAY_MS, 3000);
+  const maxDelayMs = toInteger(process.env.DB_CONNECT_RETRY_MAX_DELAY_MS, 15000);
+  const maxWaitMs = toInteger(process.env.DB_CONNECT_MAX_WAIT_MS, 300000);
   const { target, hint } = getDatabaseEndpointSummary();
+  const startedAt = Date.now();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       await runAppMigrations();
       return;
     } catch (err) {
-      const shouldRetry = attempt < maxAttempts && isRetryableDbError(err);
+      const elapsedMs = Date.now() - startedAt;
+      const remainingMs = Math.max(0, maxWaitMs - elapsedMs);
+      const retryable = isRetryableDbError(err);
+      const shouldRetry =
+        retryable && attempt < maxAttempts && remainingMs > 0;
       console.error(
         `Database startup check failed (attempt ${attempt}/${maxAttempts}) for ${target}: ${formatStartupError(
           err
@@ -242,11 +250,30 @@ async function runMigrationsWithRetry() {
         console.error(hint);
       }
       if (!shouldRetry) {
+        if (retryable && remainingMs <= 0) {
+          console.error(
+            `Database did not become ready within ${maxWaitMs}ms.`
+          );
+        }
+        if (retryable && attempt >= maxAttempts && remainingMs > 0) {
+          console.error(
+            `Database startup retries reached max attempts (${maxAttempts}) before readiness.`
+          );
+        }
         throw err;
       }
 
-      const backoffDelayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), 15000);
-      console.error(`Retrying database connection in ${backoffDelayMs}ms...`);
+      const exponentialFactor = 2 ** Math.min(attempt - 1, 8);
+      const plannedDelayMs = Math.min(baseDelayMs * exponentialFactor, maxDelayMs);
+      const backoffDelayMs = Math.max(
+        250,
+        Math.min(plannedDelayMs, remainingMs)
+      );
+      console.error(
+        `Retrying database connection in ${backoffDelayMs}ms (${Math.ceil(
+          remainingMs / 1000
+        )}s remaining in startup wait window)...`
+      );
       await sleep(backoffDelayMs);
     }
   }

@@ -10,6 +10,13 @@ const appTimezone = /^[A-Za-z0-9_+\-/]+$/.test(configuredTimezone)
   : "Asia/Colombo";
 const databaseUrl = String(process.env.DATABASE_URL || "").trim();
 
+function formatDbError(err) {
+  const message = err?.message || String(err);
+  const code = err?.code ? ` (${err.code})` : "";
+  const severity = err?.severity ? ` [${String(err.severity)}]` : "";
+  return `${message}${code}${severity}`;
+}
+
 function isTrueFlag(value) {
   return String(value || "").trim().toLowerCase() === "true";
 }
@@ -72,8 +79,12 @@ pool.on("connect", (client) => {
   client
     .query(`SET TIME ZONE '${appTimezone.replace(/'/g, "''")}'`)
     .catch((err) => {
-      console.error("Failed to set DB session timezone:", err);
+      console.error("Failed to set DB session timezone:", formatDbError(err));
     });
+});
+
+pool.on("error", (err) => {
+  console.error("Unexpected PostgreSQL pool error:", formatDbError(err));
 });
 
 export default pool;
