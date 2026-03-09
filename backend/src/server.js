@@ -62,29 +62,33 @@ function isWeakJwtSecret(secret) {
   }
   return /change_me|changeme|default|secret|admin123|password/i.test(normalized);
 }
-function getStartupJwtSecret() {
-  const configured = String(process.env.JWT_SECRET || "").trim();
-  if (configured) {
-    return configured;
-  }
 
-  const isRailwayRuntime = Boolean(
-    String(process.env.RAILWAY_PROJECT_ID || "").trim() ||
-      String(process.env.RAILWAY_ENVIRONMENT_ID || "").trim() ||
-      String(process.env.RAILWAY_SERVICE_ID || "").trim()
+function isRailwayRuntime() {
+  return Boolean(
+    process.env.RAILWAY_ENVIRONMENT ||
+      process.env.RAILWAY_PROJECT_ID ||
+      process.env.RAILWAY_SERVICE_ID ||
+      process.env.RAILWAY_PUBLIC_DOMAIN
   );
-  if (!isRailwayRuntime) {
-    return "";
-  }
-
-  const generated = randomBytes(48).toString("hex");
-  process.env.JWT_SECRET = generated;
-  console.warn(
-    "JWT_SECRET is not set. Generated temporary secret for this Railway deployment. Set JWT_SECRET variable for stable sessions."
-  );
-  return generated;
 }
 
+function ensureJwtSecret() {
+  const configuredSecret = String(process.env.JWT_SECRET || "").trim();
+  if (configuredSecret) {
+    return configuredSecret;
+  }
+
+  if (isRailwayRuntime()) {
+    const generated = `railway-temp-${randomBytes(48).toString("hex")}`;
+    process.env.JWT_SECRET = generated;
+    console.warn(
+      "JWT_SECRET is not set. Generated temporary secret for this Railway deployment. Set JWT_SECRET variable for stable sessions."
+    );
+    return generated;
+  }
+
+  throw new Error("JWT_SECRET is required");
+}
 
 const configuredOrigins = parseCsv(
   process.env.CORS_ORIGIN || process.env.CORS_ORIGINS
@@ -238,10 +242,7 @@ function isDatabaseUnavailable(error) {
 
 async function startServer() {
   try {
-    const jwtSecret = getStartupJwtSecret();
-    if (!jwtSecret) {
-      throw new Error("JWT_SECRET is required");
-    }
+    const jwtSecret = ensureJwtSecret();
     if (isWeakJwtSecret(jwtSecret)) {
       const warningMessage =
         "JWT_SECRET appears weak. Use a long random value (32+ chars).";
