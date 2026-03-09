@@ -342,9 +342,9 @@ function toEscPosBuffer(lines) {
     const isFooterTitle = trimmed === "System Design & Powered By";
 
     if (isTotalLabel || isTotalValue) {
-      // Emphasize total section for high visibility.
+      // Keep total bold but not oversized for balanced 80mm layout.
       payload.push(Buffer.from([0x1b, 0x45, 0x01]));
-      payload.push(Buffer.from([0x1d, 0x21, 0x01]));
+      payload.push(Buffer.from([0x1d, 0x21, 0x00]));
     } else if (isFooterTitle) {
       payload.push(Buffer.from([0x1b, 0x45, 0x01]));
       payload.push(Buffer.from([0x1d, 0x21, 0x00]));
