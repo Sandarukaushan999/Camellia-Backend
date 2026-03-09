@@ -3589,15 +3589,10 @@ router.post("/backup/validate", auth, authorize("ADMIN"), async (req, res) => {
 router.post("/reset", auth, authorize("ADMIN"), async (req, res) => {
   const providedSecret = String(req.body?.secretCode || "").trim();
   const configuredSecret = String(
-    process.env.SYSTEM_RESET_SECRET || process.env.RESET_SECRET_CODE || ""
+    process.env.SYSTEM_RESET_SECRET ||
+      process.env.RESET_SECRET_CODE ||
+      "VOXO@reset"
   ).trim();
-
-  if (!configuredSecret) {
-    return res.status(500).json({
-      message:
-        "System reset secret is not configured. Set SYSTEM_RESET_SECRET in backend .env.",
-    });
-  }
 
   if (!providedSecret) {
     return res.status(400).json({ message: "Reset secret code is required" });
