@@ -6,6 +6,7 @@ const router = express.Router();
 
 const ORDER_TYPES = new Set(["DINE-IN", "TAKEAWAY", "DELIVERY"]);
 const PAYMENT_METHODS = new Set(["CASH", "CARD", "QR", "ONLINE", "OTHER"]);
+const PORTION_OPTIONS = new Set(["SMALL", "LARGE"]);
 
 function parsePositiveInt(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
@@ -76,6 +77,55 @@ function normalizePaymentMethod(value) {
 function normalizeCategory(value) {
   const category = normalizeText(value, 60);
   return category || "Other";
+}
+
+function normalizePortion(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toUpperCase();
+  return PORTION_OPTIONS.has(normalized) ? normalized : null;
+}
+
+function hasPortionPrices(product) {
+  if (product?.has_portions === true) {
+    return true;
+  }
+  const smallPrice = parseMoney(product?.small_price, NaN);
+  const largePrice = parseMoney(product?.large_price, NaN);
+  const hasSmall = Number.isFinite(smallPrice) && smallPrice > 0;
+  const hasLarge = Number.isFinite(largePrice) && largePrice > 0;
+  return hasSmall || hasLarge;
+}
+
+function resolvePortionPrice(product, portion = null) {
+  const normalizedPortion = normalizePortion(portion);
+  const fallbackPrice = parseMoney(product?.price, 0);
+  if (!hasPortionPrices(product) || !normalizedPortion) {
+    return fallbackPrice;
+  }
+
+  const smallPrice = parseMoney(product?.small_price, NaN);
+  const largePrice = parseMoney(product?.large_price, NaN);
+  const hasSmall = Number.isFinite(smallPrice) && smallPrice > 0;
+  const hasLarge = Number.isFinite(largePrice) && largePrice > 0;
+
+  if (normalizedPortion === "SMALL") {
+    if (hasSmall) {
+      return parseMoney(smallPrice, fallbackPrice);
+    }
+    if (hasLarge) {
+      return parseMoney(largePrice, fallbackPrice);
+    }
+    return fallbackPrice;
+  }
+
+  if (hasLarge) {
+    return parseMoney(largePrice, fallbackPrice);
+  }
+  if (hasSmall) {
+    return parseMoney(smallPrice, fallbackPrice);
+  }
+  return fallbackPrice;
 }
 
 async function findActiveCustomerByPhone(client, phone) {
@@ -230,6 +280,13 @@ async function fetchBranchMenuProducts(client, branchId) {
        p.name,
        p.category,
        p.image_url,
+       p.small_price,
+       p.large_price,
+       CASE
+         WHEN COALESCE(p.small_price, 0) > 0 OR COALESCE(p.large_price, 0) > 0
+           THEN TRUE
+         ELSE FALSE
+       END AS has_portions,
        COALESCE(bp.price_override, p.price) AS price,
        CASE
          WHEN bp.id IS NULL THEN p."isActive"
@@ -250,9 +307,32 @@ async function fetchBranchMenuProducts(client, branchId) {
       category: normalizeCategory(row.category),
       image_url: row.image_url || null,
       price: parseMoney(row.price, 0),
+      small_price: parseMoney(row.small_price, NaN),
+      large_price: parseMoney(row.large_price, NaN),
+      has_portions: row.has_portions === true,
       is_active: row.is_active === true,
     }))
-    .filter((item) => item.is_active && Number.isFinite(item.price) && item.price > 0);
+    .map((item) => {
+      const hasSmall = Number.isFinite(item.small_price) && item.small_price > 0;
+      const hasLarge = Number.isFinite(item.large_price) && item.large_price > 0;
+      return {
+        ...item,
+        small_price: hasSmall ? parseMoney(item.small_price, 0) : null,
+        large_price: hasLarge ? parseMoney(item.large_price, 0) : null,
+        has_portions: item.has_portions || hasSmall || hasLarge,
+      };
+    })
+    .filter((item) => {
+      if (!item.is_active) {
+        return false;
+      }
+      if (item.has_portions) {
+        const hasSmall = Number.isFinite(item.small_price) && item.small_price > 0;
+        const hasLarge = Number.isFinite(item.large_price) && item.large_price > 0;
+        return hasSmall || hasLarge || (Number.isFinite(item.price) && item.price > 0);
+      }
+      return Number.isFinite(item.price) && item.price > 0;
+    });
 }
 
 function formatQrOrderReference(id) {
@@ -371,6 +451,7 @@ router.post("/orders", async (req, res) => {
     .map((item) => ({
       product_id: String(item?.product_id || "").trim(),
       qty: parsePositiveInt(item?.qty, NaN, 1, 999),
+      portion: normalizePortion(item?.portion),
     }))
     .filter((item) => item.product_id && Number.isFinite(item.qty) && item.qty > 0);
 
@@ -407,12 +488,19 @@ router.post("/orders", async (req, res) => {
 
     const heldItems = requestedItems.map((item) => {
       const product = productMap.get(String(item.product_id));
+      const unitPrice = resolvePortionPrice(product, item.portion);
+      const baseName = product.name;
+      const displayName = item.portion
+        ? `${baseName} (${item.portion === "LARGE" ? "Large" : "Small"})`
+        : baseName;
       return {
         product_id: String(product.id || "").trim(),
-        name: product.name,
+        name: baseName,
+        display_name: displayName,
+        portion: item.portion,
         category: product.category,
         qty: item.qty,
-        price: parseMoney(product.price, 0),
+        price: parseMoney(unitPrice, 0),
       };
     });
 
