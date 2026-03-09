@@ -16,12 +16,6 @@ function quoteIdentifier(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
 }
 
-function formatMigrationError(err) {
-  const message = err?.message || String(err);
-  const code = err?.code ? ` (${err.code})` : "";
-  return `${message}${code}`;
-}
-
 async function dropForeignKeysOnColumn(client, tableName, columnName) {
   const { rows } = await client.query(
     `SELECT tc.constraint_name
@@ -631,6 +625,8 @@ export async function runAppMigrations() {
     await addColumnIfMissing(client, "users", "is_super_admin", "BOOLEAN DEFAULT FALSE");
     await addColumnIfMissing(client, "inventory_items", "unit_cost", "NUMERIC(12,2) DEFAULT 0");
     await addColumnIfMissing(client, "products", "image_url", "TEXT");
+    await addColumnIfMissing(client, "products", "small_price", "NUMERIC(10,2)");
+    await addColumnIfMissing(client, "products", "large_price", "NUMERIC(10,2)");
     await addColumnIfMissing(client, "customer_segments", "description", "TEXT");
     await addColumnIfMissing(client, "customer_segments", "filter", "JSONB DEFAULT '{}'::jsonb");
     await addColumnIfMissing(client, "customer_segments", "is_active", "BOOLEAN DEFAULT TRUE");
@@ -1415,7 +1411,7 @@ export async function runAppMigrations() {
     console.log("Database migrations completed");
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("Database migration failed:", formatMigrationError(err));
+    console.error("Database migration failed:", err);
     throw err;
   } finally {
     client.release();

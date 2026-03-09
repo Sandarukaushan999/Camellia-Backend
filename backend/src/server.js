@@ -30,7 +30,7 @@ const defaultAllowedOrigins = [
 
 function parseCsv(value) {
   return String(value || "")
-    .split(",")
+    .split(/[\s,;]+/)
     .map((item) => item.trim())
     .filter(Boolean);
 }
@@ -65,24 +65,51 @@ function isWeakJwtSecret(secret) {
 const configuredOrigins = parseCsv(
   process.env.CORS_ORIGIN || process.env.CORS_ORIGINS
 ).map(normalizeOrigin);
-const allowedOrigins = (
-  configuredOrigins.length > 0 ? configuredOrigins : defaultAllowedOrigins
-)
-  .map(normalizeOrigin)
-  .filter(Boolean);
+const hasWildcardConfigured = configuredOrigins.includes("*");
+const allowedOrigins = Array.from(
+  new Set([...defaultAllowedOrigins, ...configuredOrigins].map(normalizeOrigin))
+).filter(Boolean);
 const allowAllOrigins = isTrueFlag(process.env.CORS_ALLOW_ALL);
 const allowVercelPreviews = isTrueFlag(process.env.CORS_ALLOW_VERCEL_PREVIEWS);
+const allowLocalDevOrigins = (() => {
+  const raw = String(process.env.CORS_ALLOW_LOCALHOST || "")
+    .trim()
+    .toLowerCase();
+  if (raw === "true") {
+    return true;
+  }
+  if (raw === "false") {
+    return false;
+  }
+  return String(process.env.NODE_ENV || "").trim().toLowerCase() !== "production";
+})();
+
+function isLocalDevOrigin(origin) {
+  try {
+    const parsed = new URL(origin);
+    const host = String(parsed.hostname || "").trim().toLowerCase();
+    return (
+      parsed.protocol === "http:" &&
+      (host === "localhost" || host === "127.0.0.1" || host === "::1")
+    );
+  } catch {
+    return false;
+  }
+}
 
 function isOriginAllowed(origin) {
   if (!origin) {
     return true;
   }
-  if (allowAllOrigins) {
+  if (allowAllOrigins || hasWildcardConfigured) {
     return true;
   }
   const normalizedOrigin = normalizeOrigin(origin);
   if (!normalizedOrigin) {
     return false;
+  }
+  if (allowLocalDevOrigins && isLocalDevOrigin(normalizedOrigin)) {
+    return true;
   }
   if (allowedOrigins.includes(normalizedOrigin)) {
     return true;
@@ -107,34 +134,29 @@ app.use((_, res, next) => {
   res.setHeader("Referrer-Policy", "same-origin");
   next();
 });
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
 
-const publicCors = cors({
-  origin: true,
+const corsOptions = {
+  origin(origin, callback) {
+    if (isOriginAllowed(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("Not allowed by CORS"));
+  },
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false,
+  credentials: true,
   optionsSuccessStatus: 204,
-});
+};
 
-app.use("/api/public", publicCors, publicRoutes);
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (isOriginAllowed(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error("Not allowed by CORS"));
-    },
-    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-    optionsSuccessStatus: 204,
-  })
-);
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
 app.use((err, _req, res, next) => {
   if (err?.message === "Not allowed by CORS") {
     return res.status(403).json({ message: "CORS origin denied" });
+  }
+  if (err instanceof SyntaxError && err?.status === 400 && "body" in err) {
+    return res.status(400).json({ message: "Invalid JSON payload" });
   }
   return next(err);
 });
@@ -153,141 +175,48 @@ app.use("/api/branches", branchRoutes);
 app.use("/api/supply", supplyRoutes);
 app.use("/api/operations", operationsRoutes);
 app.use("/api/analytics", analyticsRoutes);
+app.use("/api/public", publicRoutes);
 
 const port = process.env.PORT || 4000;
-const retryableDbErrorCodes = new Set([
-  "ECONNREFUSED",
-  "ETIMEDOUT",
-  "ENOTFOUND",
-  "EAI_AGAIN",
-  "ECONNRESET",
-  "57P03", // cannot_connect_now
-]);
 
-function toInteger(value, fallbackValue) {
-  const parsed = Number.parseInt(String(value || ""), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function getDatabaseEndpointSummary() {
-  const rawDatabaseUrl = String(process.env.DATABASE_URL || "").trim();
-  if (!rawDatabaseUrl) {
-    return {
-      target: "missing DATABASE_URL",
-      hint:
-        "Set DATABASE_URL in your backend environment variables before deployment.",
-    };
+function parseDatabaseTarget() {
+  const fallback = { host: "localhost", port: 5432 };
+  const connectionString = String(process.env.DATABASE_URL || "").trim();
+  if (!connectionString) {
+    return fallback;
   }
 
   try {
-    const parsed = new URL(rawDatabaseUrl);
-    const host = parsed.hostname || "unknown-host";
-    const portFromUrl = parsed.port || "5432";
-    const isPrivateIpv4 =
-      /^10\.\d+\.\d+\.\d+$/.test(host) ||
-      /^127\.\d+\.\d+\.\d+$/.test(host) ||
-      /^192\.168\.\d+\.\d+$/.test(host) ||
-      /^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/.test(host);
-    const isLocalHost = host === "localhost";
-
-    if (isLocalHost || isPrivateIpv4) {
-      return {
-        target: `${host}:${portFromUrl}`,
-        hint:
-          "DATABASE_URL points to a local/private host. Use a public or same-network PostgreSQL endpoint for this deployment target.",
-      };
-    }
-
-    return { target: `${host}:${portFromUrl}`, hint: "" };
+    const parsed = new URL(connectionString);
+    const host = parsed.hostname || fallback.host;
+    const portValue = Number(parsed.port) || fallback.port;
+    return { host, port: portValue };
   } catch {
-    return {
-      target: "invalid DATABASE_URL",
-      hint:
-        "DATABASE_URL is malformed. Use format: postgres://user:pass@host:5432/dbname",
-    };
+    return fallback;
   }
 }
 
-function formatStartupError(err) {
-  const code = err?.code ? ` (${err.code})` : "";
-  const severity = err?.severity ? ` [${String(err.severity)}]` : "";
-  const message = err?.message || String(err);
-  return `${message}${code}${severity}`;
+function collectNetworkCodes(error) {
+  const nested = Array.isArray(error?.errors) ? error.errors : [];
+  return [error, ...nested]
+    .map((entry) => String(entry?.code || "").trim().toUpperCase())
+    .filter(Boolean);
 }
 
-function isRetryableDbError(err) {
-  return retryableDbErrorCodes.has(String(err?.code || "").toUpperCase());
-}
-
-async function runMigrationsWithRetry() {
-  const maxAttempts = toInteger(process.env.DB_CONNECT_RETRY_ATTEMPTS, 60);
-  const baseDelayMs = toInteger(process.env.DB_CONNECT_RETRY_DELAY_MS, 3000);
-  const maxDelayMs = toInteger(process.env.DB_CONNECT_RETRY_MAX_DELAY_MS, 15000);
-  const maxWaitMs = toInteger(process.env.DB_CONNECT_MAX_WAIT_MS, 300000);
-  const { target, hint } = getDatabaseEndpointSummary();
-  const startedAt = Date.now();
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      await runAppMigrations();
-      return;
-    } catch (err) {
-      const elapsedMs = Date.now() - startedAt;
-      const remainingMs = Math.max(0, maxWaitMs - elapsedMs);
-      const retryable = isRetryableDbError(err);
-      const shouldRetry =
-        retryable && attempt < maxAttempts && remainingMs > 0;
-      console.error(
-        `Database startup check failed (attempt ${attempt}/${maxAttempts}) for ${target}: ${formatStartupError(
-          err
-        )}`
-      );
-      if (hint) {
-        console.error(hint);
-      }
-      if (!shouldRetry) {
-        if (retryable && remainingMs <= 0) {
-          console.error(
-            `Database did not become ready within ${maxWaitMs}ms.`
-          );
-        }
-        if (retryable && attempt >= maxAttempts && remainingMs > 0) {
-          console.error(
-            `Database startup retries reached max attempts (${maxAttempts}) before readiness.`
-          );
-        }
-        throw err;
-      }
-
-      const exponentialFactor = 2 ** Math.min(attempt - 1, 8);
-      const plannedDelayMs = Math.min(baseDelayMs * exponentialFactor, maxDelayMs);
-      const backoffDelayMs = Math.max(
-        250,
-        Math.min(plannedDelayMs, remainingMs)
-      );
-      console.error(
-        `Retrying database connection in ${backoffDelayMs}ms (${Math.ceil(
-          remainingMs / 1000
-        )}s remaining in startup wait window)...`
-      );
-      await sleep(backoffDelayMs);
-    }
-  }
+function isDatabaseUnavailable(error) {
+  const networkCodes = collectNetworkCodes(error);
+  return networkCodes.some((code) =>
+    ["ECONNREFUSED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND"].includes(
+      code
+    )
+  );
 }
 
 async function startServer() {
   try {
     const jwtSecret = String(process.env.JWT_SECRET || "").trim();
-    const databaseUrl = String(process.env.DATABASE_URL || "").trim();
     if (!jwtSecret) {
       throw new Error("JWT_SECRET is required");
-    }
-    if (!databaseUrl) {
-      throw new Error("DATABASE_URL is required");
     }
     if (isWeakJwtSecret(jwtSecret)) {
       const warningMessage =
@@ -298,7 +227,7 @@ async function startServer() {
       console.warn(warningMessage);
     }
 
-    await runMigrationsWithRetry();
+    await runAppMigrations();
     const server = app.listen(port, () => {
       // eslint-disable-next-line no-console
       console.log(`Backend listening on port ${port}`);
@@ -316,7 +245,17 @@ async function startServer() {
       process.exit(1);
     });
   } catch (err) {
-    console.error("Failed to start backend:", formatStartupError(err));
+    if (isDatabaseUnavailable(err)) {
+      const dbTarget = parseDatabaseTarget();
+      console.error(
+        `Database is unreachable at ${dbTarget.host}:${dbTarget.port}.`
+      );
+      console.error(
+        "Start PostgreSQL, then run the backend again. If you use Docker Desktop, run `docker compose up -d` from the project root."
+      );
+      process.exit(1);
+    }
+    console.error("Failed to start backend:", err);
     process.exit(1);
   }
 }

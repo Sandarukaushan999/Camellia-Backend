@@ -370,6 +370,16 @@ function formatHeldInvoiceNumber(heldOrderId) {
   return `VOXO${String(safeId).padStart(6, "0")}`;
 }
 
+function normalizePortionType(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toUpperCase();
+  if (normalized === "SMALL" || normalized === "LARGE") {
+    return normalized;
+  }
+  return null;
+}
+
 function normalizeHeldItems(items) {
   if (!Array.isArray(items)) {
     return [];
@@ -381,6 +391,12 @@ function normalizeHeldItems(items) {
       const qty = Number.parseFloat(item?.qty);
       const price = parseMoney(item?.price, NaN);
       const name = String(item?.name || "").trim().slice(0, 120);
+      const displayNameRaw = String(
+        item?.display_name || item?.displayName || ""
+      )
+        .trim()
+        .slice(0, 140);
+      const portion = normalizePortionType(item?.portion);
       const category = item?.category
         ? String(item.category).trim().slice(0, 50)
         : null;
@@ -395,6 +411,12 @@ function normalizeHeldItems(items) {
       return {
         product_id: productId,
         name: name || `Item ${productId}`,
+        display_name:
+          displayNameRaw ||
+          (portion
+            ? `${name || `Item ${productId}`} (${portion === "SMALL" ? "Small" : "Large"})`
+            : name || `Item ${productId}`),
+        portion,
         qty: Math.round(qty * 1000) / 1000,
         price,
         category: category || null,

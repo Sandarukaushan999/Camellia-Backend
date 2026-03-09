@@ -8,9 +8,11 @@ const router = express.Router();
 const DEFAULT_PORT = 9100;
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_PAPER_SIZE = "80mm";
-const DEFAULT_CHARS_PER_LINE = 48;
+const DEFAULT_MODEL = "XPrinter XP-80T";
+const DEFAULT_CHARS_PER_LINE_80MM = 42;
+const DEFAULT_CHARS_PER_LINE_58MM = 32;
 const MIN_CHARS_PER_LINE = 32;
-const MAX_CHARS_PER_LINE = 56;
+const MAX_CHARS_PER_LINE = 48;
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -49,6 +51,20 @@ function repeat(char, count) {
   return String(char || " ").repeat(Math.max(0, count));
 }
 
+function padLeft(text, width) {
+  const normalized = normalizeText(text);
+  if (width <= 0) return "";
+  if (normalized.length >= width) return normalized.slice(-width);
+  return `${repeat(" ", width - normalized.length)}${normalized}`;
+}
+
+function padRight(text, width) {
+  const normalized = normalizeText(text);
+  if (width <= 0) return "";
+  if (normalized.length >= width) return normalized.slice(0, width);
+  return `${normalized}${repeat(" ", width - normalized.length)}`;
+}
+
 function alignCenter(text, width) {
   const normalized = normalizeText(text);
   if (!normalized) return "";
@@ -78,27 +94,75 @@ function alignLeftRight(left, right, width) {
   return `${leftText.slice(0, availableLeft)} ${rightText}`;
 }
 
+function formatQty(value) {
+  const qty = toNumber(value, 0);
+  if (Number.isInteger(qty)) {
+    return String(qty);
+  }
+  return qty.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function getItemColumns(width) {
+  const amountWidth = width >= 42 ? 10 : 8;
+  const rateWidth = width >= 42 ? 9 : 8;
+  const qtyWidth = 4;
+  const nameWidth = Math.max(10, width - amountWidth - rateWidth - qtyWidth - 3);
+  return {
+    nameWidth,
+    qtyWidth,
+    rateWidth,
+    amountWidth,
+  };
+}
+
 function wrapText(text, width) {
   const normalized = normalizeText(text);
-  if (!normalized) return [];
+  if (!normalized || width <= 0) return [];
 
   const words = normalized.split(/\s+/).filter(Boolean);
   if (words.length === 0) return [];
 
   const lines = [];
-  let current = words[0];
+  let current = "";
 
-  for (let i = 1; i < words.length; i += 1) {
-    const word = words[i];
-    if (`${current} ${word}`.length <= width) {
-      current = `${current} ${word}`;
+  const pushChunkedWord = (word) => {
+    let cursor = 0;
+    while (cursor < word.length) {
+      const chunk = word.slice(cursor, cursor + width);
+      if (chunk) {
+        lines.push(chunk);
+      }
+      cursor += width;
+    }
+  };
+
+  for (const rawWord of words) {
+    if (rawWord.length > width) {
+      if (current) {
+        lines.push(current);
+        current = "";
+      }
+      pushChunkedWord(rawWord);
+      continue;
+    }
+
+    if (!current) {
+      current = rawWord;
+      continue;
+    }
+
+    if (`${current} ${rawWord}`.length <= width) {
+      current = `${current} ${rawWord}`;
     } else {
       lines.push(current);
-      current = word;
+      current = rawWord;
     }
   }
 
-  lines.push(current);
+  if (current) {
+    lines.push(current);
+  }
+
   return lines;
 }
 
@@ -131,7 +195,9 @@ function buildReceiptLines(receipt, charsPerLine) {
   lines.push(alignLeftRight("Invoice", resolveInvoiceNumber(receipt), width));
   lines.push(alignLeftRight("Date", escapeField(receipt?.date), width));
   lines.push(alignLeftRight("Time", escapeField(receipt?.time), width));
-  lines.push(alignLeftRight("Order Type", escapeField(receipt?.orderType || "DINE-IN"), width));
+  lines.push(
+    alignLeftRight("Order Type", escapeField(receipt?.orderType || "DINE-IN"), width)
+  );
 
   if (receipt?.orderType === "DINE-IN" && receipt?.tableNumber) {
     lines.push(alignLeftRight("Table", escapeField(receipt.tableNumber), width));
@@ -139,28 +205,44 @@ function buildReceiptLines(receipt, charsPerLine) {
   if (receipt?.customerName) {
     lines.push(alignLeftRight("Customer", escapeField(receipt.customerName), width));
   }
+  if (receipt?.customerPhone) {
+    lines.push(alignLeftRight("Phone", escapeField(receipt.customerPhone), width));
+  }
+  if (receipt?.note) {
+    wrapText(`Note: ${escapeField(receipt.note)}`, width).forEach((line) => lines.push(line));
+  }
   lines.push(alignLeftRight("Cashier", escapeField(receipt?.cashier || "System"), width));
   lines.push(createSeparator(width, "-"));
 
-  lines.push(alignLeftRight("Item", "Amount", width));
+  const items = Array.isArray(receipt?.items) ? receipt.items : [];
+  const { nameWidth, qtyWidth, rateWidth, amountWidth } = getItemColumns(width);
+  lines.push(
+    `${padRight("Item", nameWidth)} ${padLeft("Qty", qtyWidth)} ${padLeft(
+      "Rate",
+      rateWidth
+    )} ${padLeft("Amt", amountWidth)}`
+  );
   lines.push(createSeparator(width, "-"));
-  (Array.isArray(receipt?.items) ? receipt.items : []).forEach((item) => {
+  items.forEach((item) => {
     const itemName = escapeField(item?.name || "Item");
     const qty = toNumber(item?.qty, 0);
     const unitPrice = toNumber(item?.price, 0);
     const itemTotal = qty * unitPrice;
+    const itemNameLines = wrapText(itemName, nameWidth);
+    const lineItems = itemNameLines.length > 0 ? itemNameLines : ["Item"];
 
-    wrapText(itemName, width).forEach((line) => lines.push(line));
-    lines.push(
-      alignLeftRight(
-        `${qty} x ${formatMoney(unitPrice)}`,
-        formatMoney(itemTotal),
-        width
-      )
-    );
+    lineItems.forEach((line, index) => {
+      const qtyText = index === 0 ? padLeft(formatQty(qty), qtyWidth) : repeat(" ", qtyWidth);
+      const rateText =
+        index === 0 ? padLeft(formatMoney(unitPrice), rateWidth) : repeat(" ", rateWidth);
+      const amountText =
+        index === 0 ? padLeft(formatMoney(itemTotal), amountWidth) : repeat(" ", amountWidth);
+      lines.push(`${padRight(line, nameWidth)} ${qtyText} ${rateText} ${amountText}`);
+    });
   });
 
   lines.push(createSeparator(width, "-"));
+  lines.push(alignLeftRight("Items", String(items.length), width));
   lines.push(alignLeftRight("Subtotal", formatMoney(receipt?.subtotal), width));
 
   if (toNumber(receipt?.serviceCharge, 0) > 0) {
@@ -210,7 +292,8 @@ function buildReceiptLines(receipt, charsPerLine) {
   }
 
   lines.push(createSeparator(width, "="));
-  lines.push(alignLeftRight("TOTAL (LKR)", formatMoney(receipt?.total), width));
+  lines.push(alignCenter("TOTAL (LKR)", width));
+  lines.push(alignCenter(formatMoney(receipt?.total), width));
   lines.push(createSeparator(width, "="));
   lines.push(alignLeftRight("Payment", escapeField(receipt?.paymentMethod || "CASH"), width));
 
@@ -221,9 +304,23 @@ function buildReceiptLines(receipt, charsPerLine) {
     lines.push(alignLeftRight("Balance", formatMoney(receipt?.balance), width));
   }
 
+  lines.push(createSeparator(width, "-"));
+  // Keep a small visual gap before the VOXOsolutions footer section.
   lines.push("");
-  lines.push(alignCenter("Thank you for visiting!", width));
-  lines.push(alignCenter("VOXOsolution", width));
+  lines.push("");
+  [
+    "System Design & Powered By",
+    "VOXOsolutions.com",
+    "(c) 2026 All rights reserved.",
+    "ERP / POS / WEBSITE / SOFTWARE SOLUTIONS",
+    "0710901871",
+    "voxosolution@gmail.com",
+    "Thank you for visiting!",
+  ].forEach((entry) => {
+    wrapText(entry, width).forEach((line) => {
+      lines.push(alignCenter(line, width));
+    });
+  });
 
   return lines;
 }
@@ -235,13 +332,35 @@ function toEscPosBuffer(lines) {
   payload.push(Buffer.from([0x1b, 0x40]));
   payload.push(Buffer.from([0x1b, 0x74, 0x00]));
   payload.push(Buffer.from([0x1b, 0x61, 0x00]));
+  payload.push(Buffer.from([0x1b, 0x45, 0x00]));
+  payload.push(Buffer.from([0x1d, 0x21, 0x00]));
 
   lines.forEach((line) => {
-    payload.push(Buffer.from(`${line}\n`, "ascii"));
+    const trimmed = String(line || "").trim();
+    const isTotalLabel = trimmed === "TOTAL (LKR)";
+    const isTotalValue = /^\d+(?:\.\d{2})$/.test(trimmed);
+    const isFooterTitle = trimmed === "System Design & Powered By";
+
+    if (isTotalLabel || isTotalValue) {
+      // Emphasize total section for high visibility.
+      payload.push(Buffer.from([0x1b, 0x45, 0x01]));
+      payload.push(Buffer.from([0x1d, 0x21, 0x01]));
+    } else if (isFooterTitle) {
+      payload.push(Buffer.from([0x1b, 0x45, 0x01]));
+      payload.push(Buffer.from([0x1d, 0x21, 0x00]));
+    } else {
+      payload.push(Buffer.from([0x1b, 0x45, 0x00]));
+      payload.push(Buffer.from([0x1d, 0x21, 0x00]));
+    }
+
+    payload.push(Buffer.from(`${line}\r\n`, "ascii"));
   });
 
-  // Feed paper and full cut.
-  payload.push(Buffer.from([0x1b, 0x64, 0x04]));
+  // Reset font scaling/emphasis before cut.
+  payload.push(Buffer.from([0x1d, 0x21, 0x00]));
+  payload.push(Buffer.from([0x1b, 0x45, 0x00]));
+  // Feed enough paper so long footer lines are fully visible before cut.
+  payload.push(Buffer.from([0x1b, 0x64, 0x08]));
   payload.push(Buffer.from([0x1d, 0x56, 0x00]));
 
   return Buffer.concat(payload);
@@ -304,6 +423,8 @@ router.post("/escpos", auth, authorize("ADMIN", "CASHIER"), async (req, res) => 
   try {
     const printer = req.body?.printer || {};
     const receipt = req.body?.receipt || {};
+    const requestedModel = normalizeText(printer.model || DEFAULT_MODEL).toUpperCase();
+    const isXp80T = requestedModel.includes("XP-80T") || requestedModel.includes("XP80T");
 
     const host = normalizeText(printer.host || "");
     const port = clamp(
@@ -317,20 +438,25 @@ router.post("/escpos", auth, authorize("ADMIN", "CASHIER"), async (req, res) => 
       15000
     );
 
-    const paperSize =
-      String(printer.paperSize || DEFAULT_PAPER_SIZE).toLowerCase() === "58mm"
+    const paperSize = isXp80T
+      ? "80mm"
+      : String(printer.paperSize || DEFAULT_PAPER_SIZE).toLowerCase() === "58mm"
         ? "58mm"
         : "80mm";
-    const charsPerLine = clamp(
-      Math.round(
-        toNumber(
-          printer.charsPerLine,
-          paperSize === "58mm" ? 32 : DEFAULT_CHARS_PER_LINE
-        )
-      ),
-      MIN_CHARS_PER_LINE,
-      MAX_CHARS_PER_LINE
-    );
+    const charsPerLine = isXp80T
+      ? DEFAULT_CHARS_PER_LINE_80MM
+      : clamp(
+          Math.round(
+            toNumber(
+              printer.charsPerLine,
+              paperSize === "58mm"
+                ? DEFAULT_CHARS_PER_LINE_58MM
+                : DEFAULT_CHARS_PER_LINE_80MM
+            )
+          ),
+          MIN_CHARS_PER_LINE,
+          MAX_CHARS_PER_LINE
+        );
 
     if (!host) {
       return res.status(400).json({
@@ -351,9 +477,11 @@ router.post("/escpos", auth, authorize("ADMIN", "CASHIER"), async (req, res) => 
     return res.json({
       message: "Receipt sent to printer",
       mode: "ESC_POS_TCP",
-      model: "XPrinter XP-K200L",
+      model: isXp80T ? DEFAULT_MODEL : requestedModel || DEFAULT_MODEL,
       host,
       port,
+      paperSize,
+      charsPerLine,
       bytes: commandBuffer.length,
     });
   } catch (error) {

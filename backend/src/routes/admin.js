@@ -163,6 +163,81 @@ function parseMoney(value, fallback = 0) {
   return Math.round(parsed * 100) / 100;
 }
 
+function parseOptionalMoney(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const raw = String(value).trim();
+  if (!raw) {
+    return null;
+  }
+  const parsed = parseMoney(raw, NaN);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return NaN;
+  }
+  return parsed;
+}
+
+function normalizeProductPricing(payload = {}) {
+  const smallPrice = parseOptionalMoney(payload?.small_price);
+  const largePrice = parseOptionalMoney(payload?.large_price);
+  const unitPrice = parseOptionalMoney(payload?.price);
+  const requestedPortionMode =
+    payload?.has_portions === true ||
+    String(payload?.pricing_mode || "")
+      .trim()
+      .toUpperCase() === "PORTION";
+  const hasAnyPortionInput = smallPrice !== null || largePrice !== null;
+  const usePortionMode = requestedPortionMode || hasAnyPortionInput;
+
+  if (Number.isNaN(smallPrice) || Number.isNaN(largePrice) || Number.isNaN(unitPrice)) {
+    return {
+      error: "Price values must be valid non-negative numbers",
+    };
+  }
+
+  if (usePortionMode && smallPrice === null && largePrice === null) {
+    return {
+      error: "Provide small_price and/or large_price for portion pricing",
+    };
+  }
+
+  const resolvedSmallPrice =
+    usePortionMode && smallPrice === null ? largePrice : smallPrice;
+  const resolvedLargePrice =
+    usePortionMode && largePrice === null ? smallPrice : largePrice;
+  const hasPortionPrices =
+    usePortionMode &&
+    (Number.isFinite(resolvedSmallPrice) || Number.isFinite(resolvedLargePrice));
+
+  const resolvedSmallValue = Number.isFinite(resolvedSmallPrice)
+    ? Number(resolvedSmallPrice)
+    : 0;
+  const resolvedLargeValue = Number.isFinite(resolvedLargePrice)
+    ? Number(resolvedLargePrice)
+    : 0;
+
+  if (hasPortionPrices && resolvedSmallValue <= 0 && resolvedLargeValue <= 0) {
+    return {
+      error: "Small/Large prices must be greater than zero",
+    };
+  }
+
+  const fallbackPrice = hasPortionPrices
+    ? resolvedSmallValue > 0
+      ? resolvedSmallPrice
+      : resolvedLargePrice
+    : null;
+  const effectivePrice = unitPrice !== null ? unitPrice : fallbackPrice;
+
+  return {
+    smallPrice: hasPortionPrices ? resolvedSmallPrice : null,
+    largePrice: hasPortionPrices ? resolvedLargePrice : null,
+    price: effectivePrice,
+    hasPortions: hasPortionPrices,
+  };
+}
+
 function parseBranchId(value, fallback = 1) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -727,6 +802,13 @@ router.get("/products", auth, authorize("ADMIN"), async (req, res) => {
              p.id,
              p.name,
              p.price,
+             p.small_price,
+             p.large_price,
+             CASE
+               WHEN COALESCE(p.small_price, 0) > 0 OR COALESCE(p.large_price, 0) > 0
+                 THEN TRUE
+               ELSE FALSE
+             END AS has_portions,
              p.category,
              p.image_url,
              p."isActive" AS is_active,
@@ -743,7 +825,23 @@ router.get("/products", auth, authorize("ADMIN"), async (req, res) => {
              ON bp.branch_id = $1
             AND bp.product_id = p.id::text
            ORDER BY p.name`
-        : 'SELECT id, name, price, category, image_url, "isActive" as is_active, stock FROM products ORDER BY name',
+        : `SELECT
+             id,
+             name,
+             price,
+             small_price,
+             large_price,
+             CASE
+               WHEN COALESCE(small_price, 0) > 0 OR COALESCE(large_price, 0) > 0
+                 THEN TRUE
+               ELSE FALSE
+             END AS has_portions,
+             category,
+             image_url,
+             "isActive" as is_active,
+             stock
+           FROM products
+           ORDER BY name`,
       hasBranchFilter ? [branchId] : []
     );
     return res.json(rows);
@@ -765,6 +863,13 @@ router.get("/products/pos", auth, authorize("ADMIN", "CASHIER"), async (req, res
              p.id,
              p.name,
              COALESCE(bp.price_override, p.price) AS price,
+             p.small_price,
+             p.large_price,
+             CASE
+               WHEN COALESCE(p.small_price, 0) > 0 OR COALESCE(p.large_price, 0) > 0
+                 THEN TRUE
+               ELSE FALSE
+             END AS has_portions,
              p.category,
              p.image_url,
              p.price AS base_price,
@@ -780,7 +885,22 @@ router.get("/products/pos", auth, authorize("ADMIN", "CASHIER"), async (req, res
            WHERE p."isActive" = TRUE
              AND (bp.id IS NULL OR bp.is_active = TRUE)
            ORDER BY p.category, p.name`
-        : 'SELECT id, name, price, category, image_url FROM products WHERE "isActive" = true ORDER BY category, name',
+        : `SELECT
+             id,
+             name,
+             price,
+             small_price,
+             large_price,
+             CASE
+               WHEN COALESCE(small_price, 0) > 0 OR COALESCE(large_price, 0) > 0
+                 THEN TRUE
+               ELSE FALSE
+             END AS has_portions,
+             category,
+             image_url
+           FROM products
+           WHERE "isActive" = true
+           ORDER BY category, name`,
       hasBranchFilter ? [branchId] : []
     );
     return res.json(rows);
@@ -793,22 +913,47 @@ router.get("/products/pos", auth, authorize("ADMIN", "CASHIER"), async (req, res
 
 // Create product
 router.post("/products", auth, authorize("ADMIN"), async (req, res) => {
-  const { name, price, category, is_active: isActive = true } = req.body;
+  const { name, category, is_active: isActive = true } = req.body;
   const imageUrl = normalizeProductImageUrl(req.body?.image_url);
-  if (!name || price === undefined) {
-    return res.status(400).json({ message: "Name and price are required" });
+  const pricing = normalizeProductPricing(req.body || {});
+  if (!name) {
+    return res.status(400).json({ message: "Name is required" });
   }
-
-  // Ensure price is a number
-  const priceNum = parseFloat(price);
-  if (isNaN(priceNum) || priceNum < 0) {
-    return res.status(400).json({ message: "Price must be a valid positive number" });
+  if (pricing.error) {
+    return res.status(400).json({ message: pricing.error });
+  }
+  if (pricing.price === null) {
+    return res.status(400).json({ message: "Price is required" });
   }
 
   try {
     const { rows } = await pool.query(
-      'INSERT INTO products (name, price, category, image_url, "isActive", stock) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, price, category, image_url, "isActive" as is_active',
-      [name, priceNum, category || null, imageUrl, isActive, 0]
+      `INSERT INTO products (name, price, small_price, large_price, category, image_url, "isActive", stock)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING
+         id,
+         name,
+         price,
+         small_price,
+         large_price,
+         CASE
+           WHEN COALESCE(small_price, 0) > 0 OR COALESCE(large_price, 0) > 0
+             THEN TRUE
+           ELSE FALSE
+         END AS has_portions,
+         category,
+         image_url,
+         "isActive" as is_active`,
+      [
+        name,
+        pricing.price,
+        pricing.smallPrice,
+        pricing.largePrice,
+        category || null,
+        imageUrl,
+        isActive,
+        0,
+      ]
     );
     return res.status(201).json(rows[0]);
   } catch (err) {
@@ -824,7 +969,7 @@ router.post("/products", auth, authorize("ADMIN"), async (req, res) => {
 // Update product
 router.put("/products/:id", auth, authorize("ADMIN"), async (req, res) => {
   const { id } = req.params;
-  const { name, price, category, is_active: isActive, stock } = req.body;
+  const { name, category, is_active: isActive, stock } = req.body;
   const hasImageUrl = Object.prototype.hasOwnProperty.call(
     req.body || {},
     "image_url"
@@ -832,17 +977,50 @@ router.put("/products/:id", auth, authorize("ADMIN"), async (req, res) => {
   const imageUrl = hasImageUrl
     ? normalizeProductImageUrl(req.body?.image_url)
     : null;
+  const pricing = normalizeProductPricing(req.body || {});
 
   if (!name) {
     return res.status(400).json({ message: "Name is required" });
   }
+  if (pricing.error) {
+    return res.status(400).json({ message: pricing.error });
+  }
+  if (pricing.price === null) {
+    return res.status(400).json({ message: "Price is required" });
+  }
 
   try {
     const { rows } = await pool.query(
-      'UPDATE products SET name = $1, price = $2, category = $3, image_url = CASE WHEN $4 THEN $5 ELSE image_url END, "isActive" = $6, stock = COALESCE($7, stock) WHERE id = $8 RETURNING id, name, price, category, image_url, "isActive" as is_active, stock',
+      `UPDATE products
+       SET name = $1,
+           price = $2,
+           small_price = $3,
+           large_price = $4,
+           category = $5,
+           image_url = CASE WHEN $6 THEN $7 ELSE image_url END,
+           "isActive" = $8,
+           stock = COALESCE($9, stock)
+       WHERE id::text = $10
+       RETURNING
+         id,
+         name,
+         price,
+         small_price,
+         large_price,
+         CASE
+           WHEN COALESCE(small_price, 0) > 0 OR COALESCE(large_price, 0) > 0
+             THEN TRUE
+           ELSE FALSE
+         END AS has_portions,
+         category,
+         image_url,
+         "isActive" as is_active,
+         stock`,
       [
         name,
-        price || null,
+        pricing.price,
+        pricing.smallPrice,
+        pricing.largePrice,
         category || null,
         hasImageUrl,
         imageUrl,
@@ -866,17 +1044,86 @@ router.put("/products/:id", auth, authorize("ADMIN"), async (req, res) => {
 // Delete product
 router.delete("/products/:id", auth, authorize("ADMIN"), async (req, res) => {
   const { id } = req.params;
+  const normalizedId = String(id || "").trim();
+  if (!normalizedId) {
+    return res.status(400).json({ message: "Invalid product id" });
+  }
 
+  const client = await pool.connect();
   try {
-    const { rowCount } = await pool.query("DELETE FROM products WHERE id = $1", [id]);
-
-    if (rowCount === 0) {
+    await client.query("BEGIN");
+    const existingRes = await client.query(
+      `SELECT id::text AS id
+       FROM products
+       WHERE id::text = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedId]
+    );
+    if (existingRes.rowCount === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ message: "Product not found" });
     }
 
+    // Keep branch override table clean even if product cannot be hard-deleted.
+    await client.query("DELETE FROM branch_products WHERE product_id = $1", [normalizedId]);
+
+    const { rowCount } = await client.query(
+      "DELETE FROM products WHERE id::text = $1",
+      [normalizedId]
+    );
+
+    if (rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    await client.query("COMMIT");
     return res.json({ message: "Product deleted successfully" });
   } catch (err) {
-    return res.status(500).json({ message: "Failed to delete product" });
+    await client.query("ROLLBACK");
+    const errCode = String(err?.code || "").trim();
+    const errMessage = String(err?.message || "").toLowerCase();
+    const isConstraintError =
+      errCode.startsWith("23") ||
+      errMessage.includes("violates foreign key constraint") ||
+      errMessage.includes("is still referenced");
+    if (isConstraintError) {
+      try {
+        const deactivateRes = await pool.query(
+          `UPDATE products
+           SET "isActive" = FALSE
+           WHERE id::text = $1
+           RETURNING id`,
+          [normalizedId]
+        );
+        if (deactivateRes.rowCount > 0) {
+          return res.status(409).json({
+            message:
+              "Product is linked to existing records. It was deactivated instead of deleted.",
+            deactivated: true,
+          });
+        }
+      } catch (deactivateErr) {
+        console.error("Failed to deactivate product after FK delete conflict:", deactivateErr);
+      }
+      return res.status(409).json({
+        message: "Product is linked to existing records and cannot be deleted.",
+      });
+    }
+    console.error("Error deleting product:", {
+      code: err?.code,
+      message: err?.message,
+      detail: err?.detail,
+    });
+    const payload = { message: "Failed to delete product" };
+    if (String(process.env.NODE_ENV || "").toLowerCase() !== "production") {
+      payload.error_code = errCode || null;
+      payload.error_detail = err?.message || null;
+    }
+    return res.status(500).json(payload);
+  } finally {
+    client.release();
   }
 });
 
@@ -1487,19 +1734,41 @@ router.post(
         customer = rows[0];
       }
 
-      const requestUpdateRes = await client.query(
-        `UPDATE qr_customer_requests
-         SET status = 'APPROVED',
-             reviewed_at = NOW(),
-             reviewed_by = $2,
-             review_note = COALESCE($3, review_note),
-             approved_customer_id = $4,
-             updated_at = NOW()
-         WHERE id = $1
-         RETURNING *`,
-        [requestId, String(req.user.id), reviewNote, customer.id]
-      );
-      const updatedRequest = requestUpdateRes.rows[0];
+      let updatedRequest = null;
+      try {
+        const requestUpdateRes = await client.query(
+          `UPDATE qr_customer_requests
+           SET status = 'APPROVED',
+               reviewed_at = NOW(),
+               reviewed_by = $2,
+               review_note = COALESCE($3, review_note),
+               approved_customer_id = $4,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [requestId, String(req.user.id), reviewNote, customer.id]
+        );
+        updatedRequest = requestUpdateRes.rows[0];
+      } catch (updateErr) {
+        const looksLikeApprovedCustomerColumnIssue = /approved_customer_id/i.test(
+          String(updateErr?.message || "")
+        );
+        if (!looksLikeApprovedCustomerColumnIssue) {
+          throw updateErr;
+        }
+        const fallbackRes = await client.query(
+          `UPDATE qr_customer_requests
+           SET status = 'APPROVED',
+               reviewed_at = NOW(),
+               reviewed_by = $2,
+               review_note = COALESCE($3, review_note),
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [requestId, String(req.user.id), reviewNote]
+        );
+        updatedRequest = fallbackRes.rows[0] || null;
+      }
 
       if (updatedRequest?.held_order_id) {
         await client.query(
@@ -1534,7 +1803,11 @@ router.post(
         customer,
       });
     } catch (err) {
-      await client.query("ROLLBACK");
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback errors
+      }
       console.error("Failed to approve QR customer request:", err);
       return res.status(500).json({ message: "Failed to approve customer request" });
     } finally {
@@ -3337,6 +3610,11 @@ router.post("/reset", auth, authorize("ADMIN"), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const userCountBeforeRes = await client.query(
+      `SELECT COUNT(*)::int AS total
+       FROM users`
+    );
+    const preservedUserCount = Number(userCountBeforeRes.rows[0]?.total || 0);
     const truncatedTables = await truncateBusinessTables(client);
     await writeAuditLog(client, {
       action: "SYSTEM_RESET",
@@ -3344,12 +3622,20 @@ router.post("/reset", auth, authorize("ADMIN"), async (req, res) => {
       entity_id: null,
       actor_id: req.user.id,
       actor_role: req.user.role,
-      payload: { truncated_tables: truncatedTables },
+      payload: {
+        truncated_tables: truncatedTables,
+        preserved_users: preservedUserCount,
+      },
     });
     await client.query("COMMIT");
     return res.json({
-      message: "System reset completed successfully",
+      message:
+        "System reset completed successfully. User/admin credentials were preserved.",
       truncatedTables,
+      preserved: {
+        users: preservedUserCount,
+        credentials: true,
+      },
     });
   } catch (err) {
     await client.query("ROLLBACK");

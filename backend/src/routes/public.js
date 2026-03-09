@@ -1,24 +1,11 @@
 import express from "express";
+import { randomUUID } from "crypto";
 import pool from "../db.js";
 
 const router = express.Router();
 
 const ORDER_TYPES = new Set(["DINE-IN", "TAKEAWAY", "DELIVERY"]);
 const PAYMENT_METHODS = new Set(["CASH", "CARD", "QR", "ONLINE", "OTHER"]);
-const RETRYABLE_DB_ERROR_CODES = new Set([
-  "ECONNREFUSED",
-  "ETIMEDOUT",
-  "ENOTFOUND",
-  "EAI_AGAIN",
-  "ECONNRESET",
-  "57P03", // cannot_connect_now
-]);
-const PUBLIC_DB_CONNECT_TIMEOUT_MS = parsePositiveInt(
-  process.env.PUBLIC_DB_CONNECT_TIMEOUT_MS,
-  12000,
-  1000,
-  120000
-);
 
 function parsePositiveInt(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
@@ -91,50 +78,6 @@ function normalizeCategory(value) {
   return category || "Other";
 }
 
-function formatError(err) {
-  const message = err?.message || String(err);
-  const code = err?.code ? ` (${err.code})` : "";
-  return `${message}${code}`;
-}
-
-function statusFromDbError(err) {
-  const code = String(err?.code || "").trim().toUpperCase();
-  return RETRYABLE_DB_ERROR_CODES.has(code) ? 503 : 500;
-}
-
-function handlePublicRouteError(res, logPrefix, err, fallbackMessage) {
-  const status = statusFromDbError(err);
-  console.error(`${logPrefix}: ${formatError(err)}`);
-  if (status === 503) {
-    return res.status(503).json({
-      message: "Service temporarily unavailable. Please try again in a moment.",
-    });
-  }
-  return res.status(status).json({ message: fallbackMessage });
-}
-
-async function connectPublicDbClient() {
-  let timeoutHandle = null;
-  try {
-    return await Promise.race([
-      pool.connect(),
-      new Promise((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-          const timeoutError = new Error(
-            `Timed out waiting for database connection after ${PUBLIC_DB_CONNECT_TIMEOUT_MS}ms`
-          );
-          timeoutError.code = "ETIMEDOUT";
-          reject(timeoutError);
-        }, PUBLIC_DB_CONNECT_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
-  }
-}
-
 async function findActiveCustomerByPhone(client, phone) {
   const normalizedPhone = normalizePhone(phone);
   if (!normalizedPhone) {
@@ -151,94 +94,91 @@ async function findActiveCustomerByPhone(client, phone) {
   return rows[0] || null;
 }
 
-async function upsertQrCustomerRequest(
+async function upsertCrmCustomerByPhone(
   client,
-  {
-    branchId,
-    heldOrderId,
-    customerName,
-    customerPhone,
-    customerEmail,
-    customerAddress,
-    meta = {},
-  }
+  { customerName, customerPhone, customerEmail, customerAddress }
 ) {
   const normalizedPhone = normalizePhone(customerPhone);
   if (!normalizedPhone) {
     return null;
   }
 
-  const safeMeta =
-    meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {};
-
   const existingRes = await client.query(
-    `SELECT id
-     FROM qr_customer_requests
-     WHERE customer_phone = $1
-       AND COALESCE(branch_id, 1) = $2
-       AND status = 'PENDING'
-     ORDER BY requested_at DESC
-     LIMIT 1
+    `SELECT id, full_name, phone, email, address
+     FROM customers
+     WHERE phone = $1
      FOR UPDATE`,
-    [normalizedPhone, Number(branchId || 1)]
+    [normalizedPhone]
   );
-  const existing = existingRes.rows[0];
 
+  const existing = existingRes.rows[0];
   if (existing) {
     const { rows } = await client.query(
-      `UPDATE qr_customer_requests
-       SET held_order_id = $2,
-           customer_name = $3,
-           customer_email = $4,
-           customer_address = $5,
-           request_count = COALESCE(request_count, 0) + 1,
-           last_order_at = NOW(),
-           requested_at = NOW(),
-           updated_at = NOW(),
-           meta = COALESCE(meta, '{}'::jsonb) || $6::jsonb
+      `UPDATE customers
+       SET full_name = COALESCE(NULLIF($2, ''), full_name),
+           email = COALESCE(NULLIF($3, ''), email),
+           address = COALESCE(NULLIF($4, ''), address),
+           is_active = TRUE,
+           updated_at = NOW()
        WHERE id = $1
-       RETURNING id, status`,
+       RETURNING id, full_name, phone, email, address`,
       [
-        Number(existing.id),
-        Number(heldOrderId || 0) || null,
-        customerName,
-        customerEmail || null,
-        customerAddress || null,
-        JSON.stringify(safeMeta),
+        existing.id,
+        normalizeText(customerName, 120) || "QR Customer",
+        normalizeEmail(customerEmail) || "",
+        normalizeText(customerAddress, 500) || "",
+      ]
+    );
+    return rows[0] || existing;
+  }
+
+  try {
+    const { rows } = await client.query(
+      `INSERT INTO customers (id, full_name, phone, email, address, is_active)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       RETURNING id, full_name, phone, email, address`,
+      [
+        randomUUID(),
+        normalizeText(customerName, 120) || "QR Customer",
+        normalizedPhone,
+        normalizeEmail(customerEmail),
+        normalizeText(customerAddress, 500) || null,
       ]
     );
     return rows[0] || null;
+  } catch (err) {
+    if (String(err?.code || "") !== "23505") {
+      throw err;
+    }
+    const conflictRes = await client.query(
+      `SELECT id, full_name, phone, email, address
+       FROM customers
+       WHERE phone = $1
+       LIMIT 1`,
+      [normalizedPhone]
+    );
+    const conflictCustomer = conflictRes.rows[0] || null;
+    if (!conflictCustomer) {
+      return null;
+    }
+    const { rows } = await client.query(
+      `UPDATE customers
+       SET full_name = COALESCE(NULLIF($2, ''), full_name),
+           email = COALESCE(NULLIF($3, ''), email),
+           address = COALESCE(NULLIF($4, ''), address),
+           is_active = TRUE,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, full_name, phone, email, address`,
+      [
+        conflictCustomer.id,
+        normalizeText(customerName, 120) || "QR Customer",
+        normalizeEmail(customerEmail) || "",
+        normalizeText(customerAddress, 500) || "",
+      ]
+    );
+    return rows[0] || conflictCustomer;
   }
-
-  const { rows } = await client.query(
-    `INSERT INTO qr_customer_requests (
-       branch_id,
-       held_order_id,
-       source,
-       customer_name,
-       customer_phone,
-       customer_email,
-       customer_address,
-       status,
-       request_count,
-       meta,
-       requested_at,
-       last_order_at,
-       updated_at
-     )
-     VALUES ($1, $2, 'QR_MENU', $3, $4, $5, $6, 'PENDING', 1, $7::jsonb, NOW(), NOW(), NOW())
-     RETURNING id, status`,
-    [
-      Number(branchId || 1),
-      Number(heldOrderId || 0) || null,
-      customerName,
-      normalizedPhone,
-      customerEmail || null,
-      customerAddress || null,
-      JSON.stringify(safeMeta),
-    ]
-  );
-  return rows[0] || null;
 }
 
 async function resolvePublicBranch(client, { branchId = null, branchCode = "" } = {}) {
@@ -338,9 +278,8 @@ router.get("/menu", async (req, res) => {
     1_000_000
   );
 
-  let client = null;
+  const client = await pool.connect();
   try {
-    client = await connectPublicDbClient();
     const branch = await resolvePublicBranch(client, {
       branchId: requestedBranchId,
       branchCode: requestedBranchCode,
@@ -376,9 +315,10 @@ router.get("/menu", async (req, res) => {
       items,
     });
   } catch (err) {
-    return handlePublicRouteError(res, "Failed to load public menu", err, "Failed to load menu");
+    console.error("Failed to load public menu:", err);
+    return res.status(500).json({ message: "Failed to load menu" });
   } finally {
-    if (client) client.release();
+    client.release();
   }
 });
 
@@ -388,9 +328,8 @@ router.get("/customer-profile", async (req, res) => {
     return res.status(400).json({ message: "Valid phone is required" });
   }
 
-  let client = null;
+  const client = await pool.connect();
   try {
-    client = await connectPublicDbClient();
     const customer = await findActiveCustomerByPhone(client, customerPhone);
     return res.json({
       customer: customer
@@ -404,14 +343,10 @@ router.get("/customer-profile", async (req, res) => {
         : null,
     });
   } catch (err) {
-    return handlePublicRouteError(
-      res,
-      "Failed to lookup public customer profile",
-      err,
-      "Failed to lookup customer profile"
-    );
+    console.error("Failed to lookup public customer profile:", err);
+    return res.status(500).json({ message: "Failed to lookup customer profile" });
   } finally {
-    if (client) client.release();
+    client.release();
   }
 });
 
@@ -444,9 +379,8 @@ router.post("/orders", async (req, res) => {
   }
 
   const uniqueProductIds = [...new Set(requestedItems.map((item) => item.product_id))];
-  let client = null;
+  const client = await pool.connect();
   try {
-    client = await connectPublicDbClient();
     const branch = await resolvePublicBranch(client, {
       branchId: requestedBranchId,
       branchCode: requestedBranchCode,
@@ -457,7 +391,7 @@ router.post("/orders", async (req, res) => {
 
     const menuProducts = await fetchBranchMenuProducts(client, branch.id);
     const productMap = new Map(menuProducts.map((product) => [String(product.id), product]));
-    const existingCustomer = customerPhone
+    const existingCustomerBeforeUpsert = customerPhone
       ? await findActiveCustomerByPhone(client, customerPhone)
       : null;
 
@@ -488,6 +422,21 @@ router.post("/orders", async (req, res) => {
     );
 
     await client.query("BEGIN");
+    let crmCustomer = existingCustomerBeforeUpsert;
+    if (customerPhone) {
+      crmCustomer = await upsertCrmCustomerByPhone(client, {
+        customerName,
+        customerPhone,
+        customerEmail,
+        customerAddress,
+      });
+    }
+    const crmCustomerStatus = crmCustomer
+      ? existingCustomerBeforeUpsert
+        ? "MATCHED"
+        : "CREATED"
+      : "NO_PHONE";
+
     const heldRes = await client.query(
       `INSERT INTO held_orders (
          branch_id,
@@ -515,8 +464,8 @@ router.post("/orders", async (req, res) => {
           note: note || null,
           customer_email: customerEmail || null,
           customer_address: customerAddress || null,
-          crm_customer_id: existingCustomer?.id || null,
-          crm_customer_status: existingCustomer ? "MATCHED" : "PENDING_APPROVAL",
+          crm_customer_id: crmCustomer?.id || null,
+          crm_customer_status: crmCustomerStatus,
           estimated_total: estimatedTotal,
         }),
       ]
@@ -538,26 +487,6 @@ router.post("/orders", async (req, res) => {
       ]
     );
 
-    let customerRequest = null;
-    if (customerPhone && !existingCustomer) {
-      customerRequest = await upsertQrCustomerRequest(client, {
-        branchId: Number(branch.id),
-        heldOrderId: Number(heldOrder.id),
-        customerName,
-        customerPhone,
-        customerEmail,
-        customerAddress,
-        meta: {
-          source: "QR_MENU",
-          payment_method: paymentMethod,
-          table_number: tableNumber || null,
-          note: note || null,
-          invoice_number: invoiceNumber,
-          reference,
-        },
-      });
-    }
-
     await client.query(
       `INSERT INTO audit_logs (action, entity_type, entity_id, actor_id, actor_role, payload)
        VALUES ('QR_ORDER_CREATE', 'held_order', $1, NULL, 'CUSTOMER', $2::jsonb)`,
@@ -570,8 +499,8 @@ router.post("/orders", async (req, res) => {
           items_count: heldItems.length,
           estimated_total: estimatedTotal,
           source: "QR_MENU",
-          crm_customer_id: existingCustomer?.id || null,
-          customer_request_id: customerRequest?.id || null,
+          crm_customer_id: crmCustomer?.id || null,
+          crm_customer_status: crmCustomerStatus,
         }),
       ]
     );
@@ -583,9 +512,9 @@ router.post("/orders", async (req, res) => {
       reference,
       invoice_number: invoiceNumber,
       held_order_id: Number(heldOrder.id),
-      crm_customer_id: existingCustomer?.id || null,
-      customer_request_id: customerRequest?.id || null,
-      customer_request_status: customerRequest?.status || null,
+      crm_customer_id: crmCustomer?.id || null,
+      customer_request_id: null,
+      customer_request_status: null,
       created_at: heldOrder.created_at,
       branch: {
         id: Number(branch.id),
@@ -595,21 +524,15 @@ router.post("/orders", async (req, res) => {
       estimated_total: estimatedTotal,
     });
   } catch (err) {
-    if (client) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {
-        // ignore rollback errors
-      }
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // ignore rollback errors
     }
-    return handlePublicRouteError(
-      res,
-      "Failed to create QR menu order",
-      err,
-      "Failed to submit order"
-    );
+    console.error("Failed to create QR menu order:", err);
+    return res.status(500).json({ message: "Failed to submit order" });
   } finally {
-    if (client) client.release();
+    client.release();
   }
 });
 
