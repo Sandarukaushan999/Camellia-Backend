@@ -1,0 +1,10 @@
+{
+  "name": "camellia-backend-root",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "postinstall": "npm --prefix backend install --omit=dev --no-audit --prefer-offline",
+    "build": "npm --prefix backend install --omit=dev --no-audit --prefer-offline",
+    "start": "npm --prefix backend run start"
+  }
+}
