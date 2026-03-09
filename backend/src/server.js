@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { randomBytes } from "crypto";
 import authRoutes from "./routes/auth.js";
 import orderRoutes from "./routes/orders.js";
 import adminRoutes from "./routes/admin.js";
@@ -61,6 +62,29 @@ function isWeakJwtSecret(secret) {
   }
   return /change_me|changeme|default|secret|admin123|password/i.test(normalized);
 }
+function getStartupJwtSecret() {
+  const configured = String(process.env.JWT_SECRET || "").trim();
+  if (configured) {
+    return configured;
+  }
+
+  const isRailwayRuntime = Boolean(
+    String(process.env.RAILWAY_PROJECT_ID || "").trim() ||
+      String(process.env.RAILWAY_ENVIRONMENT_ID || "").trim() ||
+      String(process.env.RAILWAY_SERVICE_ID || "").trim()
+  );
+  if (!isRailwayRuntime) {
+    return "";
+  }
+
+  const generated = randomBytes(48).toString("hex");
+  process.env.JWT_SECRET = generated;
+  console.warn(
+    "JWT_SECRET is not set. Generated temporary secret for this Railway deployment. Set JWT_SECRET variable for stable sessions."
+  );
+  return generated;
+}
+
 
 const configuredOrigins = parseCsv(
   process.env.CORS_ORIGIN || process.env.CORS_ORIGINS
@@ -214,7 +238,7 @@ function isDatabaseUnavailable(error) {
 
 async function startServer() {
   try {
-    const jwtSecret = String(process.env.JWT_SECRET || "").trim();
+    const jwtSecret = getStartupJwtSecret();
     if (!jwtSecret) {
       throw new Error("JWT_SECRET is required");
     }
